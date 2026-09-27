@@ -1,0 +1,71 @@
+# Spec — hack CLI（`src/hack.ts` + `src/config.ts`）
+
+## 要构建什么
+
+- 目标：`pnpm hack` 一条命令把 Typora 变成已激活状态；同一入口提供回滚、状态与自动验收，
+  并在版本不兼容时自动回滚，不留坏包。
+
+## 行为
+
+- 无参数执行：备份 → 取入口原文 → 注入 → 重新打包 → 写注册表 → 启动验收 → 报告。
+- `--no-verify`：跳过启动验收（仍然打补丁），并在输出中提示跳过的风险。
+- `--restore`：把 `app.asar` 从备份拷回，并清空注册表 `SLicense`。
+- `--status`：只读打印安装路径、备份、入口名与是否已注入、注册表两个键、以及生效的邮箱/序列号。
+- `--yes` / `-y`：跳过「Typora 正在运行」的确认。
+- `--help` / `-h`：打印用法。
+- 幂等：重复执行不会重复备份；Typora 被重装/升级后，备份会自动刷新。
+- 配置：邮箱与序列号来自 `环境变量 > 仓库根目录 .env > src/config.ts 的默认值`。
+
+## 输入 / 输出
+
+- 输入：
+  - 命令行标志；
+  - `%LOCALAPPDATA%\Programs\Typora\resources\app.asar`（及其同目录备份）；
+  - 模板文件 `src/inject/patch.js`；
+  - 可选的 `<repo>/.env`。
+- 输出：
+  - 覆盖后的 `app.asar`；
+  - 首次执行时产生的 `app.asar.hapora-orig.bak`；
+  - 注册表 `HKCU\SOFTWARE\Typora` 的 `SLicense` / `IDate`；
+  - stdout 的步骤报告；
+  - 验收时启动 Typora 进程并读取 `%APPDATA%\Typora\typora.log`。
+
+## 约束
+
+- 任何写操作之前必须先有可用的备份。
+- 非 Windows 平台直接退出，不做降级。
+- 找不到 Typora 安装、或包内 `package.json` 没有 `main`，以非零码退出。
+- 临时工作目录必须在 `finally` 中清理，失败路径不留残渣。
+- 仅当失败**可归因于补丁**时才回滚；环境性的失败（例如根本没等到日志）保留补丁并提示。
+- 序列号形状不符只警告，不阻断。
+
+## 边界条件
+
+- Typora 正在运行：无 `--yes` 时提示后退出（非零码）；有 `--yes` 时结束进程，等待 1.5s 再继续。
+- 备份已存在且其中已是打过补丁的入口：视为异常，直接报错，不产出坏包。
+- 备份不存在但当前 `app.asar` 已被打过补丁：先剥离补丁得到原始内容，再重新注入。
+- 备份记录的是另一个入口名（换过版本）：刷新备份。
+- 注入后的长度回填导致字节数变化：报错，不打包。
+- 验收判定必须**晚于启动 ~1s 的自校验窗口**：`hasL: true` 在 ~0.1s 出现，自校验在 ~1s 才跑完，
+  仅凭 `hasL` 提前宣判会误报成功。
+- 验收只能读**最后一次启动**的日志片段：`typora.log` 会轮转，按文件长度切片会读到上一次运行的内容。
+- 验收失败且命中 `Integrity check failed` / `unfill due to renew fail`：判为补丁不兼容 → 自动回滚 + 清注册表。
+- 40s 内既无激活标记也无致命信号：判为无法判定，补丁保留并提示手动观察。
+
+## 验收标准
+
+- [x] 在干净的 Typora `1.14.10` 上执行 `pnpm hack --yes`，输出 `✓ 激活成功：…（自校验后仍存活）`。
+- [x] 执行后 `typora.log` 中同时出现 `[L] pass`、`[watch L] hasL: true`、`[renewLicense]: license renewed`，
+      且不出现 `Integrity check failed` 与 `onUnfillLicense`，进程不退出。
+- [x] Typora 主窗口持续存在，界面上没有 `UNREGISTERED` 水印。
+- [x] 许可证对话框显示「已使用以下序列号激活」，邮箱与序列号等于配置值。
+- [x] 重复执行 `pnpm hack` 不报错，且仍只保留一份备份。
+- [x] 人为制造不兼容（关掉自校验放行的两层）：`pnpm hack` 报验收失败并把 `app.asar` 还原成备份内容。
+- [x] `pnpm hack --restore` 后重新启动 Typora 回到未激活状态。
+- [x] `pnpm hack --status` 不改动任何文件。
+- [x] 改 `.env` 里的 `EMAIL` / `CODE` 后重新 hack，许可证对话框显示新值。
+
+## 完成定义
+
+- 如何判定已完成：在未打补丁的 Typora 上一次 `pnpm hack` 成功，以上验收清单全部勾选；
+  失败时命令以非零码退出并给出可读原因与回滚结果。

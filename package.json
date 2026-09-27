@@ -1,0 +1,18 @@
+{
+  "name": "hapora",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Typora 激活机制研究与激活补丁",
+  "type": "module",
+  "scripts": {
+    "hack": "tsx src/hack.ts"
+  },
+  "dependencies": {
+    "@electron/asar": "^3.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  }
+}

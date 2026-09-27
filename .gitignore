@@ -1,0 +1,25 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build outputs
+*.asar
+*.asar.unpacked
+
+# Temp
+/tmp/
+*.tmp
+*.bak
+
+# 本地配置
+.env
