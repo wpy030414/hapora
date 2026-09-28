@@ -2,10 +2,11 @@
  * pnpm hack —— Typora 激活补丁的唯一入口。
  *
  * 做的事：
- *   1. 定位 Typora 安装目录并（首次/换版本后）留一份原始 app.asar 备份
- *   2. 从包内 package.json 读出入口文件名，把 src/inject/patch.js 注入其中
- *   3. 写入注册表 SLicense / IDate
- *   4. 启动 Typora 并从 typora.log 验收；验收失败且可归因于补丁时自动回滚
+ *   1. 定位 Typora 安装目录，判断是否需要（首次/换版本后）留一份原始 app.asar 备份
+ *   2. 从包内 package.json 读出入口文件名，把 src/inject/patch.js 注入其中，打包到临时目录
+ *   3. 把备份与成品写进安装目录；写不动时只对这一批复制做一次 UAC 提权
+ *   4. 写入注册表 SLicense / IDate
+ *   5. 启动 Typora 并从 typora.log 验收；验收失败且可归因于补丁时自动回滚
  *
  * 不对 Typora 版本、入口文件名、字节码文件名做任何硬编码假设。
  *
@@ -42,21 +43,17 @@ const ok = (msg: string) => console.log(`  ✓ ${msg}`);
 const bad = (msg: string) => console.log(`  ✗ ${msg}`);
 
 /**
- * 保证备份可用：
+ * 判断备份该怎么处理（只看状态，不落盘——真正的写入统一在 installFiles 里做，可能要提权）：
  *   - 没有备份      → 建一份
  *   - 备份已过期    → 刷新（当前 asar 的入口与备份记录的不一致 ⇒ 被重装/升级过）
  *   - 当前已被改过  → 保留旧备份（它才是原始内容的来源）
  */
-function ensureBackup(install: tp.TyporaInstall): "created" | "refreshed" | "kept" {
-  if (!existsSync(install.backup)) {
-    tp.backup(install);
-    return "created";
-  }
+function planBackup(install: tp.TyporaInstall): "created" | "refreshed" | "kept" {
+  if (!existsSync(install.backup)) return "created";
   const backedEntry = readMain(install.backup);
   const currentEntry = readMain(install.asar);
   const current = readEntry(install.asar, currentEntry);
   if (currentEntry !== backedEntry || (!isPatched(current) && current !== readEntry(install.backup, backedEntry))) {
-    tp.backup(install);
     return "refreshed";
   }
   return "kept";
@@ -84,16 +81,18 @@ function printStatus(install: tp.TyporaInstall, config: Config): void {
   say();
 }
 
-async function doRestore(install: tp.TyporaInstall): Promise<void> {
-  if (tp.isRunning()) {
-    say("检测到 Typora 正在运行，先关闭它…");
-    tp.kill();
-  }
-  if (!tp.restore(install)) {
+async function doRestore(install: tp.TyporaInstall, elevate: boolean): Promise<void> {
+  if (!existsSync(install.backup)) {
     say(`找不到备份 ${install.backup}，无法回滚。`);
     process.exitCode = 1;
     return;
   }
+  if (tp.isRunning()) {
+    say("检测到 Typora 正在运行，先关闭它…");
+    tp.kill();
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  tp.installFiles([{ from: install.backup, to: install.asar }], { elevate });
   reg.write("SLicense", "");
   ok("已从备份恢复 app.asar，并清空注册表 SLicense");
   say("  重新打开 Typora 即回到未激活状态。");
@@ -144,7 +143,11 @@ async function verify(install: tp.TyporaInstall): Promise<Verdict> {
   return { activated: false, fatal: false, detail: `等待 ${VERIFY_TIMEOUT_MS / 1000}s 仍未在日志中看到激活标记` };
 }
 
-async function doHack(install: tp.TyporaInstall, config: Config, opts: { verify: boolean; yes: boolean }): Promise<void> {
+async function doHack(
+  install: tp.TyporaInstall,
+  config: Config,
+  opts: { verify: boolean; yes: boolean; elevate: boolean },
+): Promise<void> {
   say("Typora 激活补丁");
   say();
 
@@ -160,15 +163,14 @@ async function doHack(install: tp.TyporaInstall, config: Config, opts: { verify:
     await new Promise((r) => setTimeout(r, 1500));
   }
 
-  // 1. 备份
-  const backupState = ensureBackup(install);
-  if (backupState === "created") ok(`已备份原始 app.asar → ${install.backup}`);
-  else if (backupState === "refreshed") ok("检测到 Typora 被重装/升级，已刷新原始备份");
-  else ok("已存在原始备份，跳过备份");
+  // 1. 备份（只定状态，落盘和补丁一起在最后一次性做掉）
+  const backupState = planBackup(install);
+  // 备份要（重新）建时，它的来源就是当前的 app.asar；否则以已有备份为准
+  const source = backupState === "kept" ? install.backup : install.asar;
 
   // 2. 注入（入口名来自包内 package.json 的 main）
-  const entryName = readMain(install.backup);
-  const original = stripPatch(readEntry(install.backup, entryName));
+  const entryName = readMain(source);
+  const original = stripPatch(readEntry(source, entryName));
   if (isPatched(original)) throw new Error("备份里的入口文件已含补丁，请先回滚");
   const result = inject(entryName, original, loadTemplate(), config);
   ok(`入口 ${entryName}：原始 ${Buffer.byteLength(original)}B → 注入后 ${result.selfLen}B`);
@@ -176,23 +178,34 @@ async function doHack(install: tp.TyporaInstall, config: Config, opts: { verify:
     say(`  ! 序列号 ${config.licenseCode} 不匹配 Typora 的 ([A-Z0-9]{6}-){3}[A-Z0-9]{6} 形状，仅作展示用`);
   }
 
+  // 3. 打包到临时目录 —— 全程在本用户可写的目录里做，不碰安装目录
   const work = mkdtempSync(join(tmpdir(), "hapora-"));
   try {
-    await unpack(install.asar, work);
-    writeFileSync(join(work, entryName), result.patched);
-    await pack(work, install.asar);
-    ok("app.asar 已重新打包");
+    const staged = join(work, "app.asar");
+    await unpack(source, join(work, "unpacked"));
+    writeFileSync(join(work, "unpacked", entryName), result.patched);
+    await pack(join(work, "unpacked"), staged);
+
+    // 4. 落盘 —— 唯一需要管理员权限的一步；备份先写、成品后写，一次做完
+    const jobs: tp.CopyJob[] = [];
+    if (backupState !== "kept") jobs.push({ from: install.asar, to: install.backup });
+    jobs.push({ from: staged, to: install.asar });
+    tp.installFiles(jobs, { elevate: opts.elevate });
   } finally {
     rmSync(work, { recursive: true, force: true });
   }
+  if (backupState === "created") ok(`已备份原始 app.asar → ${install.backup}`);
+  else if (backupState === "refreshed") ok("检测到 Typora 被重装/升级，已刷新原始备份");
+  else ok("已存在原始备份，跳过备份");
+  ok(opts.elevate ? "app.asar 已重新打包，并提权写入安装目录" : "app.asar 已重新打包并写入安装目录");
 
-  // 3. 注册表
+  // 5. 注册表
   const today = new Date();
   reg.write("SLicense", licenseRegistryValue(today));
   reg.write("IDate", formatDate(today));
   ok(`注册表已写入 HKCU\\SOFTWARE\\Typora（SLicense 明文 ${LICENSE_MARKER}）`);
 
-  // 4. 验收（失败且可归因于补丁时自动回滚）
+  // 6. 验收（失败且可归因于补丁时自动回滚）
   say();
   if (!opts.verify) {
     say("完成。重新打开 Typora 即为已激活状态。");
@@ -212,11 +225,12 @@ async function doHack(install: tp.TyporaInstall, config: Config, opts: { verify:
     say("  该 Typora 版本的结构与补丁预期不符，正在回滚到原始状态…");
     tp.kill();
     await new Promise((r) => setTimeout(r, 1000));
-    if (tp.restore(install)) {
+    try {
+      tp.installFiles([{ from: install.backup, to: install.asar }], { elevate: opts.elevate });
       reg.write("SLicense", "");
       ok("已回滚。你的 Typora 回到未激活状态，功能不受影响");
-    } else {
-      bad("回滚失败，请手动执行：  pnpm hack --restore");
+    } catch (err) {
+      bad(`回滚失败（${(err as Error).message}），请手动执行：  pnpm hack --restore`);
     }
     say(`  请把 ${join(process.env.APPDATA ?? "", "Typora", "typora.log")} 里最后一次启动的日志提供给维护者。`);
   } else {
@@ -240,15 +254,32 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const install = tp.locate();
   if (!install) {
-    say("未找到 Typora（%LOCALAPPDATA%\\Programs\\Typora\\resources\\app.asar）。");
+    say(tp.locateError());
     process.exitCode = 1;
     return;
   }
 
+  // --status 只读，不写任何东西
   if (has("--status")) return printStatus(install, config);
-  if (has("--restore")) return doRestore(install);
+
+  // 后面都要改写安装目录里的 app.asar。写不了就提权，但只提权「写文件」那一步：
+  // 打包在临时目录里做，Typora 仍以普通用户身份启动与验收。
+  const elevate = !tp.checkWriteAccess(install.asar);
+  if (elevate) {
+    if (tp.isAdmin()) {
+      say(`没有写入权限：${install.asar}`);
+      say("  当前已以管理员身份运行但仍无法写入，请检查文件是否被占用或磁盘是否可写。");
+      process.exitCode = 1;
+      return;
+    }
+    say(`Typora 位于系统目录（${install.dir}），改写 app.asar 需要管理员权限。`);
+    say("  打包会在临时目录里完成，最后弹出一次 UAC 提权窗口来写入文件。");
+    say();
+  }
+
+  if (has("--restore")) return doRestore(install, elevate);
   say(`配置：邮箱 ${config.email}，序列号 ${config.licenseCode}（来自 ${join(repoRoot(), ".env")} 或默认值）`);
-  return doHack(install, config, { verify: !has("--no-verify"), yes: has("--yes", "-y") });
+  return doHack(install, config, { verify: !has("--no-verify"), yes: has("--yes", "-y"), elevate });
 }
 
 main().catch((err) => {

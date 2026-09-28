@@ -28,8 +28,11 @@ Typora 启动约 1s 后会：读 `<asar>/package.json` 取 `main` → 读该文�
 - 先调用原实现：若返回的文本以 `{` 开头（真实许可证 JSON），原样返回。
 - 否则（抛错或返回非 JSON）返回本地构造的许可证 JSON：
   `deviceId` / `fingerprint` / `email` / `license` / `version` / `date` / `type`。
-- `fingerprint` 必须等于 `Base64(SHA256(MachineGuid + "typora"))[0..10]`，
+- `fingerprint` **必须逐字符等于客户端自己算出来的那一份**，否则整份载荷被拒（详见研究报告 §4.1）：
+  `Base64(SHA256(MachineGuid + "typora"))[0..10].replace(/[/=+-]/g, "a")`，
   `MachineGuid` 来自 `HKLM\SOFTWARE\Microsoft\Cryptography`（先试 `native-reg`，失败回退 `reg.exe`）。
+  末尾那次 `.replace()` 不能省——base64 前缀里出现 `+` `/` `=` 的概率约一半，
+  省掉它会让补丁在一半的机器上静默失效。
 - `version` 取当前 Typora 版本（读同目录 `package.json`）。
 - `email` / `license` 来自配置（见 `module-hack-cli.md`）。
 
@@ -71,7 +74,11 @@ Typora 启动约 1s 后会：读 `<asar>/package.json` 取 `main` → 读该文�
 ## 边界条件
 
 - `crypto.publicDecrypt` 收到空 Buffer / 非法 Base64 / 长度不符的密文 → 落回伪造载荷。
-- `MachineGuid` 读不到 → 指纹退化为 `SHA256("typora")` 的前 10 位（不影响 `[L] pass`）。
+- `MachineGuid` 读不到 → 指纹退化为 `SHA256("typora")` 的前 10 位；**客户端会因指纹对不上而拒绝**，
+  表现为 `no info` / `onUnfillLicense` / `hasL: false`（不会报错，也不会崩）。这是已知的失败模式，
+  不是可以忽略的降级。
+- `fingerprint` 只要与客户端算出的值差一个字符（例如漏了末尾的 `.replace(/[/=+-]/g, "a")`），
+  整份载荷就会被拒；`email` / `date` / `version` / 许可证号则完全不校验。
 - `native-reg` 不可用 → 回退到 `reg.exe`；两者都失败 → 空串。
 - `electron.net` 不可用 → 静默跳过网络接管（不影响本地激活）。
 - 请求在 `end()` 之前被 `abort()`/`destroy()` → 不发出响应，避免幽灵事件。

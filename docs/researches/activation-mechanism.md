@@ -1,7 +1,7 @@
 # Typora 激活机制研究报告
 
 > 样本：Typora `1.14.10`（安装器版本 `42.2.0`），Electron `42.2.0` / Node `24.15.0`，Windows 11
-> 安装路径：`%LOCALAPPDATA%\Programs\Typora`
+> 安装路径：`%ProgramFiles%\Typora` 或 `%LOCALAPPDATA%\Programs\Typora`
 > 研究方法：在明文入口 `launch.dist.js` 中注入探针（Hook `crypto`、`electron.net`、`fs`、`child_process`），
 > 逐次启动读取 `%APPDATA%\Typora\typora.log`，用运行时可观测行为反推逻辑。
 
@@ -105,22 +105,40 @@ data = 256 字节 Buffer（Base64 解码后的密文）
 }
 ```
 
-**本地校验只认「解密结果非空且能解析」**，不校验 `fingerprint` / `email` / `date` / `version` / 许可证号格式
-（这几项在后续实验里逐个改成无意义值，仍然 `[L] pass`）。唯一真实的约束是解密这一步本身要成功——
-一旦让 `publicDecrypt` 返回合法 JSON，这条链路就通了。
+**本地校验不比对 `email` / `date` / `version` / 许可证号内容**（这几项逐个改成无意义值，仍然 `[L] pass`）。
+
+但 **`fingerprint` 是硬校验**：必须与客户端自己算出来的那一份**逐字符相等**，否则报 `no info` +
+`onUnfillLicense` + `hasL: false`，而且**不写任何错误日志**——表现就是「补丁装了，但没激活」。
+早期「只要求能解析成 JSON」的结论是错的，原因见 §4.1：当时研究机算出的指纹恰好不含特殊字符，
+把这条约束掩盖掉了。（复核方法：拿一份确定能通过的载荷，**只改 `fingerprint` 一个字段**，
+其余原样——一票就能分辨。）
 
 ### 4.1 机器指纹
 
 ```
-fingerprint = Base64(SHA256(MachineGuid + "typora"))[0..10]
+fingerprint = Base64(SHA256(MachineGuid + "typora"))[0..10].replace(/[/=+-]/g, "a")
 MachineGuid = HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid（WOW64_64KEY）
 ```
 
-实测 `MachineGuid = xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` ⇒
-`SHA256("5cfb…dab" + "typora")` = `xxxxxxxxxxRpdZIudcgyPdEiMTSkBCpuuCVOWqqhZ70=` ⇒ 取前 10 位 `xxxxxxxxxx`，
-与许可证里的 `fingerprint` 完全一致。
+**末尾那次替换必须写**，这是最容易漏的一步：客户端算完指纹后会再跑一次
+`"<10 位>".replace(/[/=+-]/g, "a")`（实测抓到的调用：输入 `yvhGV/vuID`，模式 `/[/=+-]/`，替换串 `a`）。
+base64 字母表里含 `+` `/` `=`，10 位前缀中出现它们的概率约一半，所以**约一半的机器**上少写这一步
+就会静默失效，而另一部分机器上一切正常——这正是它极易被误判成「只在这台机器上坏」的原因。
+
+本机实测（`MachineGuid = 383072f8-…-629f795d9725`）：
+
+```
+SHA256("…9725typora") → base64 = yvhGV/vuID29a/GE0xOFdLL10eH2mUngVHt8UmbkgCo=
+slice(0, 10)                   = yvhGV/vuID     ← 少一次替换，被拒
+.replace(/[/=+-]/g, "a")       = yvhGVavuID     ← 与许可证里的 fingerprint 完全一致
+```
 
 > 注意：`fingerprint` 用的是 `MachineGuid`，而续期请求里的 `u` 用的是 `profile.data` 的 `uuid`，两者不同源。
+
+**另一条容易读错的地方**：启动时解密走的就是 `crypto.publicDecrypt`，但它发生在日志里
+`[WindowsLicenseLocalStore] SLicense` 与 `pure = undefined` **之后约 125ms**——
+`typora.log` 的毫秒计数**不等于** `process.uptime()`，两者相差约 120ms。
+照日志时间戳推断「决定发生在解密之前」会得出完全错误的结论（这个坑也踩过）。
 
 ## 5. 联网协议
 
@@ -226,7 +244,7 @@ Timeout._onTimeout          (jsc @ 0x76543)      ← 启动后 1000ms 的定时�
 | 位置 | 作用 |
 |---|---|
 | `fs.readFile(Sync)` / `fs.promises.readFile` + `crypto.createHash` | 把入口文件的读取「倒带」回随包发布的内容 / 直接返回基准哈希 ⇒ 通过第 6 节的自校验 |
-| `crypto.publicDecrypt` | 让任意密文都能解出合法许可证 JSON ⇒ `[L] pass` / `hasL: true` |
+| `crypto.publicDecrypt` | 让任意密文都能解出合法许可证 JSON，且 `fingerprint` 必须等于客户端自己算的那一份（§4.1）⇒ `[L] pass` / `hasL: true` |
 | `electron.net.request` | 让续期返回 `{success:true}` ⇒ 不被 `onUnfillLicense` 打回；让更新 JSON 回报当前版本 ⇒ 无更新弹窗 |
 
 三者都不需要网关、不需要 hosts、不需要改字节码。

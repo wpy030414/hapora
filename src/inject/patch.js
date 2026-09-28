@@ -46,8 +46,12 @@
     } catch (e) { /* 读取失败 */ }
     return "";
   }
+  /* 指纹必须是客户端自己算出来的那一份：sha256(MachineGuid + "typora") 的 base64 前 10 位，
+   * 再把 [/=+-] 一律换成 "a"（Typora 自己就是这么做的，末尾的 replace 不能省——
+   * 少了它，base64 里出现 / + = - 的机器（约一半）会因指纹对不上而拒绝我们伪造的载荷）。 */
   function fingerprint() {
-    return crypto.createHash("sha256").update(machineId() + "typora").digest("base64").slice(0, 10);
+    return crypto.createHash("sha256").update(machineId() + "typora").digest("base64")
+      .slice(0, 10).replace(/[/=+-]/g, "a");
   }
   function fakeLicense() {
     return {
@@ -155,9 +159,8 @@
   crypto.publicDecrypt = function () {
     try {
       var out = origPublicDecrypt.apply(this, arguments);
-      var text = out.toString("utf8");
-      if (text.charAt(0) === "{") return out; /* 真实许可证：原样放行 */
-    } catch (e) { /* 非法密文 → 落入伪造载荷 */ }
+      if (out.toString("utf8").charAt(0) === "{") return out; /* 真实许可证：原样放行 */
+    } catch (e) { /* 密文非法（长度不对 / 填充不对）→ 落入伪造载荷 */ }
     return Buffer.from(JSON.stringify(fakeLicense()), "utf8");
   };
 
