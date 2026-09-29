@@ -33,6 +33,14 @@ import {
 const argv = process.argv.slice(2);
 const has = (...names: string[]) => names.some((n) => argv.includes(n));
 
+/** 取 `--flag value` 或 `--flag=value` 的值 */
+function flagValue(name: string): string | undefined {
+  const eq = argv.find((a) => a.startsWith(`${name}=`));
+  if (eq) return eq.slice(name.length + 1);
+  const i = argv.indexOf(name);
+  return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
+}
+
 const START_MARKER = "------------------start------------------";
 /** 自校验在启动约 1s 后触发，判定成功必须等它过去 */
 const SETTLE_MS = 6000;
@@ -246,13 +254,14 @@ async function main(): Promise<void> {
     return;
   }
   if (has("--help", "-h")) {
-    say("用法：pnpm hack [--no-verify] [--restore] [--status] [--yes]");
+    say("用法：pnpm hack [--dir <Typora安装目录>] [--no-verify] [--restore] [--status] [--yes]");
+    say("  --dir <路径>  显式指定 Typora 安装根目录（装在非常规位置时使用；也可用环境变量 HAPORA_TYPORA_DIR）");
     say("可自定义：仓库根目录 .env 里的 EMAIL / CODE（也可用环境变量覆盖）");
     return;
   }
 
   const config = loadConfig();
-  const install = tp.locate();
+  const install = tp.locate(flagValue("--dir"));
   if (!install) {
     say(tp.locateError());
     process.exitCode = 1;

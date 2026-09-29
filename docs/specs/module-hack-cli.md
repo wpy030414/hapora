@@ -11,6 +11,8 @@
 - 安装目录不可写时（典型是 `%ProgramFiles%\Typora`）：解包 / 注入 / 打包全部在用户临时目录里完成，
   最后用**一次** UAC 提权把「备份 + 成品」复制进安装目录，其余步骤（写注册表、启动 Typora、读日志）
   仍以普通用户身份进行。目录可写时不提权。
+- `--dir <路径>`：显式指定 Typora 安装根目录。指向的目录里没有 `resources\app.asar` 时**直接报错退出**，
+  不回退到自动探测（显式指定必须被尊重，静默猜别处比报错更糟）。
 - `--no-verify`：跳过启动验收（仍然打补丁），并在输出中提示跳过的风险。
 - `--restore`：把 `app.asar` 从备份拷回，并清空注册表 `SLicense`。
 - `--status`：只读打印安装路径、备份、入口名与是否已注入、注册表两个键、以及生效的邮箱/序列号。
@@ -23,10 +25,16 @@
 
 - 输入：
   - 命令行标志；
-  - Typora 安装目录下的 `resources\app.asar`，按序搜索：
-    1. `%ProgramFiles%\Typora`
-    2. `%ProgramFiles(x86)%\Typora`
-    3. `%LOCALAPPDATA%\Programs\Typora`
+  - Typora 安装目录下的 `resources\app.asar`。Typora 可能装在任意位置（D 盘、绿色版目录等），
+    因此按「便宜 → 昂贵、命中即止」的顺序汇集候选，**每个候选都以该目录下存在 `resources\app.asar` 为准**：
+    1. 显式指定：`--dir <路径>` 或环境变量 `HAPORA_TYPORA_DIR`（无效即报错，不回退）
+    2. 注册表 `App Paths\Typora.exe`（HKLM / WOW6432Node / HKCU）与文件关联
+       （`HKCR\Typora.md\shell\open\command`、`HKCR\Applications\Typora.exe\shell\open\command`）里的 exe 路径
+    3. `where Typora.exe`（PATH）
+    4. `%ProgramFiles%\Typora`、`%ProgramFiles(x86)%\Typora`、`%LOCALAPPDATA%\Programs\Typora`
+    5. 注册表卸载表里 `DisplayName` 为 Typora 的 `InstallLocation` / `UninstallString`
+    6. 全盘浅扫描：各固定盘根下的常见子目录（`Typora`、`Program Files\Typora`、`Apps\Typora` 等），
+       再退化为深度 ≤3、目录数 ≤20000 的遍历（跳过 `Windows`、`AppData`、`$Recycle.Bin` 等噪声目录）
   - （及其同目录备份）；
   - 模板文件 `src/inject/patch.js`；
   - 可选的 `<repo>/.env`。
@@ -46,7 +54,8 @@
 - 提权必须是一次性的批量动作（备份与成品在同一次 UAC 里完成），不能弹两次。
 - 提权被拒（用户在 UAC 里点「否」）→ 非零码退出并说明「什么都没写」。
 - 找到 Typora、读包、注入、打包这些步骤不得要求任何额外权限。
-- 找不到 Typora 安装、或包内 `package.json` 没有 `main`，以非零码退出。
+- 找不到 Typora 安装、或包内 `package.json` 没有 `main`，以非零码退出；
+  定位失败时必须列出**已尝试的来源**，并提示用 `--dir` / `HAPORA_TYPORA_DIR` 显式指定。
 - 临时工作目录必须在 `finally` 中清理，失败路径不留残渣。
 - 仅当失败**可归因于补丁**时才回滚；环境性的失败（例如根本没等到日志）保留补丁并提示。
 - 序列号形状不符只警告，不阻断。
@@ -61,6 +70,10 @@
 - 备份已存在且其中已是打过补丁的入口：视为异常，直接报错，不产出坏包。
 - 备份不存在但当前 `app.asar` 已被打过补丁：先剥离补丁得到原始内容，再重新注入。
 - 备份记录的是另一个入口名（换过版本）：刷新备份。
+- 显式指定的目录里没有 `resources\app.asar`：非零码退出并说明原因，**不**回退到自动探测。
+- 定位是惰性的：某个来源命中后，其后的来源（尤其是全盘扫描）不得被执行。
+- 查询不存在的注册表键是常态，`reg.exe` 的报错不得泄漏到用户终端（`stdio.stderr` 需静默）。
+- 中文 Windows 上 `reg query /ve` 的默认值标签是 `(默认)` 而非 `(Default)`：解析默认值不得依赖标签文案。
 - 注入后的长度回填导致字节数变化：报错，不打包。
 - 验收判定必须**晚于启动 ~1s 的自校验窗口**：`hasL: true` 在 ~0.1s 出现，自校验在 ~1s 才跑完，
   仅凭 `hasL` 提前宣判会误报成功。
@@ -83,6 +96,11 @@
 - [x] `pnpm hack --restore` 后重新启动 Typora 回到未激活状态。
 - [x] `pnpm hack --status` 不改动任何文件。
 - [x] 改 `.env` 里的 `EMAIL` / `CODE` 后重新 hack，许可证对话框显示新值。
+- [x] Typora 装在默认位置时 `pnpm hack --status` 能定位到它，且耗时在百毫秒级（走注册表 App Paths，不触发全盘扫描）。
+- [x] `pnpm hack --dir <无 app.asar 的目录>`：报错「该目录下没有 resources\app.asar」并以非零码退出，不回退自动探测。
+- [x] 扫描逻辑（`scanRootsForTypora`）：根目录下深度 1 与深度 3 的 `Typora`（含 `resources\app.asar`）命中，
+      深度 4 的与「名为 Typora 但没有 app.asar」的不命中。
+- [ ] Typora 装在非默认位置（例如 `D:\Typora`、`D:\Software\Typora`）时，不带任何参数即可被自动找到。
 
 ## 完成定义
 

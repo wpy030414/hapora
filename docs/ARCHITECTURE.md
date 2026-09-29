@@ -25,7 +25,7 @@
 └───────┬────────┘
         │                              ┌────────────────┐
         ▼                              │src/registry.ts │
-%ProgramFiles%\Typora\                 │HKCU 读写        │
+%ProgramFiles%\Typora\  /  %LOCALAPPDATA%\Programs\Typora\  /  任意盘符下的浅层目录（见下）                 │HKCU 读写        │
 + %LOCALAPPDATA%\Programs\Typora\      │                 │
   resources\app.asar  ←─ 覆盖 ─────────└────────────────┘
   resources\app.asar.hapora-orig.bak  ← 首次执行时创建
@@ -49,7 +49,7 @@ Typora.exe 主进程
 | 模块 | 职责 |
 |------|------|
 | `src/hack.ts` | CLI 入口。参数解析、步骤编排、启动验收、失败回滚、输出报告。 |
-| `src/typora.ts` | 定位安装目录；检测与结束 Typora 进程；启动 Typora；把备份 / 成品写进安装目录（不可写时只对这一步用一次 UAC 提权）。 |
+| `src/typora.ts` | 定位安装目录（多来源候选：`--dir` / 注册表 App Paths 与文件关联 / PATH / 默认目录 / 卸载表 / 全盘浅扫描，命中即止）；检测与结束 Typora 进程；启动 Typora；把备份 / 成品写进安装目录（不可写时只对这一步用一次 UAC 提权）。 |
 | `src/asar.ts` | `app.asar` 的解包 / 打包 / 读单文件，以及从包内 `package.json` 读 `main`。 |
 | `src/patch.ts` | 补丁模板的加载与占位符渲染；把补丁注入到入口文件最前面；定义注册表值格式。 |
 | `src/inject/patch.js` | 真正写进 Typora 的代码：自校验放行（读取层 + 哈希层）、许可证接管、续期/更新接管。ES5 语法。 |
@@ -108,5 +108,8 @@ Typora.exe 主进程
   补丁会在一半的机器上静默失效（`no info` / `onUnfillLicense`，且没有任何错误日志）。详见研究报告 §4.1。
 - **管理员权限只用于「往安装目录写文件」**：解包、注入、打包、写注册表、启动 Typora、读日志全都不需要提权；
   提权只发生在 `installFiles()` 里，且是「备份 + 成品」一次性完成的一次 UAC。详见 ADR-008。
+- **定位不是「只认三个默认目录」**：按成本从低到高汇集候选（显式指定 → 注册表 App Paths/文件关联 →
+  PATH → 默认目录 → 卸载表 → 全盘浅扫描），命中即止，每个候选都以「目录下有 `resources\app.asar`」为准。
+  详见 ADR-009。
 - **失败要响且要可逆**：补丁自检（占位符数量、长度回填、入口存在）任何一项不满足都直接抛错；
   启动验收把「不兼容」翻译成一次自动回滚，而不是留下一个启动即退的坏包。
