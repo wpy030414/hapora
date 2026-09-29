@@ -57,7 +57,7 @@ Typora 启动约 1s 后会：读 `<asar>/package.json` 取 `main` → 读该文�
   - `__HAPORA_SELF_B64__` → 入口原文的 base64
   - `__HAPORA_SELF_LEN__` → 补丁后入口文件的字节长度，定宽 8 位
   - `__HAPORA_ENTRY__` → 入口文件名（相对 asar 根）
-  - `__HAPORA_MARKER__` → 许可证标记明文（同时用于注册表值）
+  - `__HAPORA_MARKER__` → 许可证标记明文（同时用作许可证值）
   - `__HAPORA_LICENSE_KEY__` / `__HAPORA_EMAIL__` → 伪造载荷里的序列号与邮箱
 - 输出：改写后的入口源码（字符串）。
 - 运行期输出：`typora.log` 中的 `[L] pass` / `[watch L] hasL: true` / `[renewLicense]: license renewed`。

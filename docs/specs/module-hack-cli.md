@@ -7,15 +7,16 @@
 
 ## 行为
 
-- 无参数执行：备份 → 取入口原文 → 注入 → 重新打包 → 写注册表 → 启动验收 → 报告。
-- 安装目录不可写时（典型是 `%ProgramFiles%\Typora`）：解包 / 注入 / 打包全部在用户临时目录里完成，
-  最后用**一次** UAC 提权把「备份 + 成品」复制进安装目录，其余步骤（写注册表、启动 Typora、读日志）
-  仍以普通用户身份进行。目录可写时不提权。
+- 无参数执行：备份 → 取入口原文 → 注入 → 重新打包 → 写许可证 → 启动验收 → 报告。
+- 安装目录不可写时（典型是 `%ProgramFiles%\Typora` / `/usr/share/typora`）：解包 / 注入 / 打包全部在用户
+  临时目录里完成，最后用**一次**平台提权把「备份 + 成品」复制进安装目录，其余步骤（写许可证、启动 Typora、
+  读日志）仍以普通用户身份进行。目录可写时不提权。
 - `--dir <路径>`：显式指定 Typora 安装根目录。指向的目录里没有 `resources\app.asar` 时**直接报错退出**，
   不回退到自动探测（显式指定必须被尊重，静默猜别处比报错更糟）。
 - `--no-verify`：跳过启动验收（仍然打补丁），并在输出中提示跳过的风险。
-- `--restore`：把 `app.asar` 从备份拷回，并清空注册表 `SLicense`。
-- `--status`：只读打印安装路径、备份、入口名与是否已注入、注册表两个键、以及生效的邮箱/序列号。
+- `--restore`：把 `app.asar` 从备份拷回，并清空许可证记录。
+- `--status`：只读打印安装路径、备份、入口名与是否已注入、许可证两个值、以及生效的邮箱/序列号。
+  该模式不要求许可证存储可用（未实现存储的平台照常可看状态）。
 - `--yes` / `-y`：跳过「Typora 正在运行」的确认。
 - `--help` / `-h`：打印用法。
 - 幂等：重复执行不会重复备份；Typora 被重装/升级后，备份会自动刷新。
@@ -25,30 +26,34 @@
 
 - 输入：
   - 命令行标志；
-  - Typora 安装目录下的 `resources\app.asar`。Typora 可能装在任意位置（D 盘、绿色版目录等），
-    因此按「便宜 → 昂贵、命中即止」的顺序汇集候选，**每个候选都以该目录下存在 `resources\app.asar` 为准**：
+  - Typora 的 `app.asar`。它可能装在任意位置（D 盘、绿色版目录、`.app` 包等），
+    定位规则按「便宜 → 昂贵、命中即止」组织，**每个候选都以该目录下存在平台对应的 asar 路径为准**：
     1. 显式指定：`--dir <路径>` 或环境变量 `HAPORA_TYPORA_DIR`（无效即报错，不回退）
-    2. 注册表 `App Paths\Typora.exe`（HKLM / WOW6432Node / HKCU）与文件关联
-       （`HKCR\Typora.md\shell\open\command`、`HKCR\Applications\Typora.exe\shell\open\command`）里的 exe 路径
-    3. `where Typora.exe`（PATH）
-    4. `%ProgramFiles%\Typora`、`%ProgramFiles(x86)%\Typora`、`%LOCALAPPDATA%\Programs\Typora`
-    5. 注册表卸载表里 `DisplayName` 为 Typora 的 `InstallLocation` / `UninstallString`
-    6. 全盘浅扫描：各固定盘根下的常见子目录（`Typora`、`Program Files\Typora`、`Apps\Typora` 等），
-       再退化为深度 ≤3、目录数 ≤20000 的遍历（跳过 `Windows`、`AppData`、`$Recycle.Bin` 等噪声目录）
+    2. 平台自带的索引：Windows 注册表（`App Paths` / 文件关联 / 卸载表）、macOS Spotlight（`mdfind`）、
+       Linux `which typora`
+    3. PATH
+    4. 平台常见默认目录
+    5. 浅扫描：平台相关的一组根目录 + 常见子目录，再退化为有深度与目录数上限的遍历
+    各平台的具体候选见 spec `module-platform.md`。
   - （及其同目录备份）；
   - 模板文件 `src/inject/patch.js`；
   - 可选的 `<repo>/.env`。
 - 输出：
   - 覆盖后的 `app.asar`；
   - 首次执行时产生的 `app.asar.hapora-orig.bak`；
-  - 注册表 `HKCU\SOFTWARE\Typora` 的 `SLicense` / `IDate`；
+  - 许可证记录：Windows 为注册表 `HKCU\SOFTWARE\Typora` 的 `SLicense` / `IDate`；
+    macOS / Linux 的落点尚未确认，当前在改动任何文件之前直接失败（见 spec `module-platform.md` 与 ADR-010）；
   - stdout 的步骤报告；
-  - 验收时启动 Typora 进程并读取 `%APPDATA%\Typora\typora.log`。
+  - 验收时启动 Typora 进程并读取平台对应的 `typora.log`（路径由平台层给出）。
 
 ## 约束
 
 - 任何写操作之前必须先有可用的备份。
-- 非 Windows 平台直接退出，不做降级。
+- 支持的平台：Windows / macOS / 桌面 Linux。不支持的平台以非零码退出，不做降级。
+- 平台差异（定位 / 进程 / 启动 / 日志路径 / 提权 / 许可证存储）全部由 `src/platform/` 提供，
+  本入口不得出现 `process.platform` 分支之外的平台判断。
+- 许可证存储未实现的平台：**在改动任何文件之前**以非零码退出并说明原因，
+  不得产出「打了补丁却没激活」的半成品。`--status` 与 `--restore` 不受此限。
 - **只有「写安装目录」这一步可能需要管理员**：不得因为要提权就把整个 CLI 重跑一遍，
   也不得以管理员身份去启动 Typora 或读写日志。
 - 提权必须是一次性的批量动作（备份与成品在同一次 UAC 里完成），不能弹两次。
@@ -78,7 +83,7 @@
 - 验收判定必须**晚于启动 ~1s 的自校验窗口**：`hasL: true` 在 ~0.1s 出现，自校验在 ~1s 才跑完，
   仅凭 `hasL` 提前宣判会误报成功。
 - 验收只能读**最后一次启动**的日志片段：`typora.log` 会轮转，按文件长度切片会读到上一次运行的内容。
-- 验收失败且命中 `Integrity check failed` / `unfill due to renew fail`：判为补丁不兼容 → 自动回滚 + 清注册表。
+- 验收失败且命中 `Integrity check failed` / `unfill due to renew fail`：判为补丁不兼容 → 自动回滚 + 清许可证。
 - 40s 内既无激活标记也无致命信号：判为无法判定，补丁保留并提示手动观察。
 
 ## 验收标准
@@ -98,8 +103,8 @@
 - [x] 改 `.env` 里的 `EMAIL` / `CODE` 后重新 hack，许可证对话框显示新值。
 - [x] Typora 装在默认位置时 `pnpm hack --status` 能定位到它，且耗时在百毫秒级（走注册表 App Paths，不触发全盘扫描）。
 - [x] `pnpm hack --dir <无 app.asar 的目录>`：报错「该目录下没有 resources\app.asar」并以非零码退出，不回退自动探测。
-- [x] 扫描逻辑（`scanRootsForTypora`）：根目录下深度 1 与深度 3 的 `Typora`（含 `resources\app.asar`）命中，
-      深度 4 的与「名为 Typora 但没有 app.asar」的不命中。
+- [x] 扫描逻辑（`scanRootsForInstall`，见 `module-platform.md`）：根目录下深度 1 与深度 3 的 `Typora`
+      （含 `resources\app.asar`）命中，深度 4 的与「名为 Typora 但没有 app.asar」的不命中。
 - [ ] Typora 装在非默认位置（例如 `D:\Typora`、`D:\Software\Typora`）时，不带任何参数即可被自动找到。
 
 ## 完成定义

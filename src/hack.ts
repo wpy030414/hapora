@@ -4,13 +4,15 @@
  * 做的事：
  *   1. 定位 Typora 安装目录，判断是否需要（首次/换版本后）留一份原始 app.asar 备份
  *   2. 从包内 package.json 读出入口文件名，把 src/inject/patch.js 注入其中，打包到临时目录
- *   3. 把备份与成品写进安装目录；写不动时只对这一批复制做一次 UAC 提权
- *   4. 写入注册表 SLicense / IDate
+ *   3. 把备份与成品写进安装目录；写不动时只对这一批复制做一次平台提权（UAC / sudo）
+ *   4. 写入许可证（Windows 为注册表 SLicense / IDate）
  *   5. 启动 Typora 并从 typora.log 验收；验收失败且可归因于补丁时自动回滚
  *
- * 不对 Typora 版本、入口文件名、字节码文件名做任何硬编码假设。
+ * 不对 Typora 版本、入口文件名、字节码文件名、安装位置做任何硬编码假设。
+ * 平台差异全部收敛在 src/platform/，本文件只做编排。
  *
  * 参数：
+ *   --dir <路径> 显式指定 Typora 安装根目录（装在非常规位置时用）
  *   --no-verify  打完补丁后不启动验收（默认会验收）
  *   --restore    从备份回滚到原始 app.asar
  *   --status     只打印当前状态
@@ -22,12 +24,11 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { pack, readEntry, readMain, unpack } from "./asar.js";
-import * as reg from "./registry.js";
 import * as tp from "./typora.js";
 import { loadConfig, LICENSE_SHAPE, repoRoot, type Config } from "./config.js";
 import {
   inject, isPatched, stripPatch, loadTemplate,
-  licenseRegistryValue, formatDate, LICENSE_MARKER,
+  licenseValue, formatDate, LICENSE_MARKER,
 } from "./patch.js";
 
 const argv = process.argv.slice(2);
@@ -82,8 +83,9 @@ function printStatus(install: tp.TyporaInstall, config: Config): void {
   } catch (err) {
     say(`  入口文件    读取失败：${(err as Error).message}`);
   }
-  say(`  SLicense    ${(reg.read("SLicense") ?? "").slice(0, 60) || "（空）"}`);
-  say(`  IDate       ${reg.read("IDate") ?? "（空）"}`);
+  const lic = tp.readLicense();
+  say(`  SLicense    ${(lic.license ?? "").slice(0, 60) || "（空）"}`);
+  say(`  IDate       ${lic.date ?? "（空）"}`);
   say(`  邮箱        ${config.email}`);
   say(`  序列号      ${config.licenseCode}`);
   say();
@@ -101,8 +103,8 @@ async function doRestore(install: tp.TyporaInstall, elevate: boolean): Promise<v
     await new Promise((r) => setTimeout(r, 1500));
   }
   tp.installFiles([{ from: install.backup, to: install.asar }], { elevate });
-  reg.write("SLicense", "");
-  ok("已从备份恢复 app.asar，并清空注册表 SLicense");
+  tp.clearLicense();
+  ok("已从备份恢复 app.asar，并清空许可证记录");
   say("  重新打开 Typora 即回到未激活状态。");
 }
 
@@ -119,7 +121,7 @@ function lastRunSegment(text: string): string {
  * fatal=true 表示失败可归因于补丁（自校验没放行 / 续期被判失败）⇒ 应当回滚。
  */
 async function verify(install: tp.TyporaInstall): Promise<Verdict> {
-  const logPath = join(process.env.APPDATA ?? "", "Typora", "typora.log");
+  const logPath = tp.logPath();
   const readLog = () => (existsSync(logPath) ? readFileSync(logPath, "utf-8") : "");
 
   const before = readLog();
@@ -207,11 +209,10 @@ async function doHack(
   else ok("已存在原始备份，跳过备份");
   ok(opts.elevate ? "app.asar 已重新打包，并提权写入安装目录" : "app.asar 已重新打包并写入安装目录");
 
-  // 5. 注册表
+  // 5. 许可证
   const today = new Date();
-  reg.write("SLicense", licenseRegistryValue(today));
-  reg.write("IDate", formatDate(today));
-  ok(`注册表已写入 HKCU\\SOFTWARE\\Typora（SLicense 明文 ${LICENSE_MARKER}）`);
+  tp.writeLicense({ license: licenseValue(today), date: formatDate(today) });
+  ok(`许可证已写入（明文标记 ${LICENSE_MARKER}）`);
 
   // 6. 验收（失败且可归因于补丁时自动回滚）
   say();
@@ -235,12 +236,12 @@ async function doHack(
     await new Promise((r) => setTimeout(r, 1000));
     try {
       tp.installFiles([{ from: install.backup, to: install.asar }], { elevate: opts.elevate });
-      reg.write("SLicense", "");
+      tp.clearLicense();
       ok("已回滚。你的 Typora 回到未激活状态，功能不受影响");
     } catch (err) {
       bad(`回滚失败（${(err as Error).message}），请手动执行：  pnpm hack --restore`);
     }
-    say(`  请把 ${join(process.env.APPDATA ?? "", "Typora", "typora.log")} 里最后一次启动的日志提供给维护者。`);
+    say(`  请把 ${tp.logPath()} 里最后一次启动的日志提供给维护者。`);
   } else {
     say("  未发现补丁导致的错误，补丁已保留。可手动启动 Typora 观察是否正常。");
   }
@@ -248,15 +249,19 @@ async function doHack(
 }
 
 async function main(): Promise<void> {
-  if (process.platform !== "win32") {
-    say("本工具只支持 Windows。");
-    process.exitCode = 1;
-    return;
-  }
   if (has("--help", "-h")) {
     say("用法：pnpm hack [--dir <Typora安装目录>] [--no-verify] [--restore] [--status] [--yes]");
     say("  --dir <路径>  显式指定 Typora 安装根目录（装在非常规位置时使用；也可用环境变量 HAPORA_TYPORA_DIR）");
     say("可自定义：仓库根目录 .env 里的 EMAIL / CODE（也可用环境变量覆盖）");
+    return;
+  }
+
+  let label: string;
+  try {
+    label = tp.platformLabel();
+  } catch (err) {
+    say((err as Error).message);
+    process.exitCode = 1;
     return;
   }
 
@@ -268,7 +273,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  // --status 只读，不写任何东西
+  // --status 只读，不写任何东西，也不需要许可证存储可用
   if (has("--status")) return printStatus(install, config);
 
   // 后面都要改写安装目录里的 app.asar。写不了就提权，但只提权「写文件」那一步：
@@ -277,17 +282,26 @@ async function main(): Promise<void> {
   if (elevate) {
     if (tp.isAdmin()) {
       say(`没有写入权限：${install.asar}`);
-      say("  当前已以管理员身份运行但仍无法写入，请检查文件是否被占用或磁盘是否可写。");
+      say("  当前已具备管理员权限但仍无法写入，请检查文件是否被占用或磁盘是否可写。");
       process.exitCode = 1;
       return;
     }
-    say(`Typora 位于系统目录（${install.dir}），改写 app.asar 需要管理员权限。`);
-    say("  打包会在临时目录里完成，最后弹出一次 UAC 提权窗口来写入文件。");
+    say(`${label}：Typora 位于需要管理员权限的目录（${install.dir}），改写 app.asar 需要提权。`);
+    say("  打包会在临时目录里完成，提权只用来写入文件。");
     say();
   }
 
   if (has("--restore")) return doRestore(install, elevate);
-  say(`配置：邮箱 ${config.email}，序列号 ${config.licenseCode}（来自 ${join(repoRoot(), ".env")} 或默认值）`);
+
+  // 许可证存储未实现的平台：在改动任何文件之前就退出，
+  // 避免留下「打了补丁却没激活」的半成品（比直接失败更难排查）。
+  if (!tp.licenseSupported()) {
+    say(tp.licenseUnsupportedReason());
+    process.exitCode = 1;
+    return;
+  }
+
+  say(`平台：${label}；邮箱 ${config.email}，序列号 ${config.licenseCode}（来自 ${join(repoRoot(), ".env")} 或默认值）`);
   return doHack(install, config, { verify: !has("--no-verify"), yes: has("--yes", "-y"), elevate });
 }
 

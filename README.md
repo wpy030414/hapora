@@ -1,6 +1,8 @@
 # hapora
 
-对 Typora（Windows 版）激活机制做逆向分析，并用**一个命令**让它变成已激活状态。
+对 Typora 激活机制做逆向分析，并用**一个命令**让它变成已激活状态。
+支持 Windows / macOS（arm64）/ 桌面 Linux；**目前只有 Windows 的许可证存储有实现**，
+其余两个平台会在改动任何文件之前明确报错（见 `docs/DECISIONS.md` ADR-010）。
 
 ## 这是什么？
 
@@ -16,7 +18,7 @@
 
 ## 如何安装和运行？
 
-前置要求：Windows 10/11、Node.js ≥ 20、pnpm、已安装 Typora（`%LOCALAPPDATA%\Programs\Typora`）。
+前置要求：Node.js ≥ 20、pnpm、已安装 Typora。
 
 ```bash
 pnpm install            # 国内网络可加 --registry=https://registry.npmmirror.com
@@ -24,7 +26,12 @@ pnpm hack               # 激活（默认会自动验收，失败则回滚）
 pnpm hack --no-verify   # 只打补丁，不启动验收
 pnpm hack --restore     # 回滚到原始状态
 pnpm hack --status      # 只看状态，不改动
+pnpm hack --dir "D:\Software\Typora"   # 装在非常规位置时显式指定安装目录
 ```
+
+安装目录的探测顺序：`--dir` / `HAPORA_TYPORA_DIR` → 注册表（Windows）/ Spotlight（macOS）/ `which`（Linux）
+→ PATH → 常见默认目录 → 卸载记录 → 各盘浅扫描。命中即止，因此装在 D 盘或绿色目录通常也能自动找到；
+实在找不到时用 `--dir` 指定，或设置环境变量 `HAPORA_TYPORA_DIR`。
 
 执行 `pnpm hack` 时若 Typora 正在运行，需要先关闭它，或加 `--yes` 让脚本自行结束进程。
 
@@ -54,7 +61,10 @@ CODE=POWER0-ED0000-BY0000-XRL000
   - 启动约 1s 的自校验窗口过去后进程仍在（`pnpm hack` 的验收会一直等到这一步才判成功）；
   - 主窗口标题为 `Typora`，界面无 `UNREGISTERED` 水印；`帮助 → 我的序列号` 显示「已使用以下序列号激活」。
 - 已知限制：
-  - 只支持 Windows。
+  - 仅 Windows 可完整激活。macOS（arm64）与桌面 Linux 的定位 / 进程 / 启动已就绪，
+    但许可证存储还没实证结论，因此这两个平台会在改动文件**之前**直接失败，而不是留下半成品。
+  - macOS 还需在真机上确认 Electron 的 asar integrity 与代码签名是否会阻断改写。
+  - 不支持 AppImage（只读镜像）。
   - 伪造的许可证载荷字段名（`deviceId` / `fingerprint` / `email` / `license` / `version` /
     `date` / `type`）来自 `1.14.x` 的实测；若上游改字段名，验收会失败并回滚。
   - 许可证服务端接口按 `/api/client/*` 前缀匹配、更新检查按 `/releases/*.json` 匹配；

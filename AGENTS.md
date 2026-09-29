@@ -1,6 +1,7 @@
 # AGENTS.md
 
-本仓库是对 Typora（Windows）激活机制的逆向研究与补丁工具，入口只有一个：`pnpm hack`。
+本仓库是对 Typora 激活机制的逆向研究与补丁工具，入口只有一个：`pnpm hack`。
+支持 Windows / macOS（arm64）/ 桌面 Linux；**当前只有 Windows 的许可证存储有实现**，其余两个平台会在改动任何文件之前显式失败（见 ADR-010）。
 
 ## 概述
 
@@ -10,15 +11,16 @@
 ## 边界与范围
 
 - 范围内：
-  - 定位 Typora 安装目录、备份与恢复原始 `app.asar`。
+  - 定位 Typora 安装目录（含非默认位置）、备份与恢复原始 `app.asar`。
   - 从包内 `package.json` 的 `main` 读出入口文件，生成并注入补丁源码。
-  - 写入 `HKCU\SOFTWARE\Typora` 下的 `SLicense` / `IDate`。
-  - 启动 Typora 并从 `%APPDATA%\Typora\typora.log` 验收；失败且可归因于补丁时自动回滚。
+  - 写入许可证：Windows 为 `HKCU\SOFTWARE\Typora` 下的 `SLicense` / `IDate`。
+  - 启动 Typora 并从平台对应的 `typora.log` 验收；失败且可归因于补丁时自动回滚。
   - 从 `.env` 读取可自定义的邮箱与序列号。
+  - 平台差异（定位 / 进程 / 启动 / 日志路径 / 提权 / 许可证存储）由 `src/platform/` 承担。
 - 非目标（明确排除）：
   - 不搭建本地许可证网关、不改 hosts、不替换 DNS。
   - 不修改 V8 字节码（`.jsc`）——所有改动都落在明文入口上。
-  - 不做跨平台支持。
+  - 不支持 AppImage（只读 squashfs 镜像）、移动端与 Windows 以外的非桌面发行版。
   - 不做通用「逆向框架」或 GUI。
 
 ## Agent 操作指南
@@ -35,8 +37,14 @@
   - 伪造载荷里的 `fingerprint` **必须逐字符等于客户端自己算的那一份**，即
     `Base64(SHA256(MachineGuid + "typora"))[0..10].replace(/[/=+-]/g, "a")`——
     末尾那次替换不能省，否则补丁会在一半的机器上静默失效（现象是「装了补丁但没激活」且无任何报错）。
-  - **管理员权限只允许用在「往安装目录写文件」这一步**：解包 / 注入 / 打包 / 写注册表 / 启动 Typora /
-    读日志都必须在普通权限下完成；提权是「备份 + 成品」一次性完成的一次 UAC，不许把整个 CLI 提权重跑。
+  - **管理员权限只允许用在「往安装目录写文件」这一步**：解包 / 注入 / 打包 / 写许可证 / 启动 Typora /
+    读日志都必须在普通权限下完成；提权是「备份 + 成品」一次性完成的一次提权
+    （Windows 一次 UAC，macOS/Linux 一次 `sudo -n`），不许把整个 CLI 提权重跑。
+  - **平台差异只允许出现在 `src/platform/`**：定位 / 进程 / 启动 / 日志路径 / 提权 / 许可证存储这六件事，
+    其余逻辑必须平台无关；`src/hack.ts` 里不得出现平台分支。`src/registry.ts` 只许 Windows 实现使用。
+  - **未实现的平台能力必须显式失败**：不得「猜一个位置写进去」——尤其许可证存储，
+    猜错会产出「打了补丁却没激活」且无任何报错的状态。宁可在改动文件之前退出。
+  - `sudo` 只允许用 `-n`（非交互），绝不能出现会等待输入密码的形式（会挂住 CLI）。
   - 补丁必须先备份再改写；任何时候都要保证 `--restore` 可用。
   - 修改补丁后必须跑一次 `pnpm hack --yes`，验收标准是日志中同时满足
     `[watch L] hasL: true`、`[renewLicense]: license renewed`，且启动 1s 后**没有**
@@ -47,13 +55,15 @@
 
 ## 目录速查
 
-- `src/hack.ts` — CLI 入口，编排备份 → 注入 → 打包 → 写注册表 → 验收/回滚。
-- `src/patch.ts` — 补丁模板的加载、占位符渲染、注入与剥除；注册表值的格式定义。
+- `src/hack.ts` — CLI 入口，编排定位 → 备份 → 注入 → 打包 → 落盘 → 写许可证 → 验收/回滚。不含平台分支。
+- `src/typora.ts` — 平台无关门面，把语义动作转给当前平台实现。
+- `src/platform/` — 平台层：`index.ts`（选择）、`types.ts`（契约与公共工具）、`scan.ts`（浅扫描）、
+  `windows.ts` / `darwin.ts` / `linux.ts`（各平台实现：定位、进程、启动、日志路径、提权、许可证）。
+- `src/patch.ts` — 补丁模板的加载、占位符渲染、注入与剥除；许可证值的格式定义。
 - `src/inject/patch.js` — 真正被注入到 Typora 入口文件的代码。
 - `src/config.ts` — 邮箱 / 序列号的可自定义项，来源优先级与默认值。
 - `src/asar.ts` — `app.asar` 解包 / 打包 / 读单文件 / 读 `main`。
-- `src/registry.ts` — `HKCU\SOFTWARE\Typora` 读写。
-- `src/typora.ts` — 安装定位、备份/恢复、进程检测与启动。
+- `src/registry.ts` — `HKCU\SOFTWARE\Typora` 读写 + 通用只读查询（仅 Windows 实现使用）。
 - `.env.example` — 可自定义项的模板（`.env` 本身不入库）。
 - `docs/researches/activation-mechanism.md` — 逆向研究报告（被改对象的机制）。
 - `docs/PRD.md` / `docs/ARCHITECTURE.md` / `docs/DECISIONS.md` — 产品目标、结构、决策记录。

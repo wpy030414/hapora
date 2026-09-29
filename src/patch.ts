@@ -108,8 +108,8 @@ export function inject(
   return { patched, selfSha256, selfLen };
 }
 
-/** 写进注册表 SLicense 的值：明文标记的 base64 + 状态 + 日期 */
-export function licenseRegistryValue(date = new Date()): string {
+/** 写进许可证存储的值（Windows 上是注册表 SLicense）：明文标记的 base64 + 状态 + 日期 */
+export function licenseValue(date = new Date()): string {
   const b64 = Buffer.from(LICENSE_MARKER, "utf-8").toString("base64");
   return `${b64}#0#${formatDate(date)}`;
 }

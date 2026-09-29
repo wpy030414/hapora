@@ -256,3 +256,39 @@
     而非「(Default)」（解析不得依赖标签文案）；查询不存在的键是常态，其 `stderr` 必须静默，
     否则会污染用户终端。
 - 何时重新审视：Typora 改成把安装位置写进某个统一入口、或提供官方的定位接口时。
+
+## ADR-010：平台差异下沉到 src/platform/，未实现的能力显式失败
+
+- 日期：2026-09-29
+- 状态：已采纳
+- 背景（遇到了什么问题）：
+  需要支持 macOS（arm64）与桌面 Linux（Ubuntu / Fedora / Arch）。一开始的判断是「只有找包的逻辑不一样，
+  其余通用」，但核对代码后发现至少六处随平台变：定位安装目录、进程检测/结束、启动、验收日志路径、
+  写入安装目录（提权）、许可证存储。其中补丁本身确实通用（`publicDecrypt` hook、`electron.net` 拦截、
+  fs/crypto 自校验放行都与平台无关），可**存储**这一层是硬差异：Windows 用 `HKCU\SOFTWARE\Typora`，
+  而 macOS / Linux 的落点（文件 / plist / keychain）没有任何实证结论 —— 日志里的类名 `[WindowsLicenseLocalStore]`
+  本身就说明每个平台一套实现，公开情报则指向 macOS 可能走 plist/Keychain。
+- 考虑过的方案：
+  1. 在 `hack.ts` 里按 `process.platform` 到处分支；
+  2. 抽一层 `Platform` 接口，把六件事下沉到 `src/platform/<id>.ts`；
+  3. 不抽层，先把 Windows 做完，跨平台以后再说。
+- 决策：采用方案 2；且**许可证存储未实现的平台，在改动任何文件之前直接失败**。
+- 为什么选这个：
+  - 方案 1 会让平台判断散落各处，加一个平台要改遍流程，且极易漏；
+  - 方案 2 让「加一个平台」= 加一个文件 + 一行分支，编排流程完全不动，也让平台行为可单独测试；
+  - 许可证存储是唯一没有实证结论的部分。**猜一个位置写进去的代价远大于失败**：猜错会产出
+    「打了补丁却没激活」的状态，日志里没有任何错误，用户与维护者都要花大力气定位；
+    显式抛错则一眼看出原因，而且因为发生在改动文件之前，Typora 仍是完好的。
+- 为什么不选其他：
+  - 方案 3 等于让第一个非 Windows 用户去撞一整面墙，而这些墙本可以现在就拆掉。
+- 后果：
+  - `src/typora.ts` 退化为平台无关门面；`src/registry.ts` 只被 Windows 实现使用；
+  - `hack.ts` 不再出现平台分支，只在平台选择失败（不支持的 OS）时报错退出；
+  - Unix 提权用 `sudo -n`（非交互）：需要密码时立刻失败并提示先 `sudo -v`，绝不挂住 CLI；
+  - macOS / Linux 上 `--status` 与 `--restore` 仍可用（它们不需要写入许可证）；
+  - 验收日志路径在 macOS / Linux 上是按 Electron userData 惯例推断的，**未在真机验证**，
+    实现里已显式标注；
+  - macOS 还有两项未验证的风险：Electron 的 asar integrity（Info.plist 内嵌 app.asar 哈希）
+    与代码签名，若启用则改写 app.asar 会导致启动失败。落地前须在 arm64 真机上确认。
+- 何时重新审视：拿到 macOS / Linux 上许可证存储的实证结论后，补上 `writeLicense`；
+  或在 arm64 真机上确认 asar integrity 会阻断改写时，重新评估 macOS 的可行性。
