@@ -1,5 +1,9 @@
 # Spec — 注入补丁（`src/inject/patch.js` + `src/patch.ts`）
 
+> **适用范围：仅 asar 路线（Windows / Linux 的 Electron 版）**。
+> macOS 版是原生应用、没有可注入的入口，走「伪造许可证记录文件」路线
+> （见 spec `module-platform.md` 与 `docs/researches/activation-mac.md`）。
+
 ## 要构建什么
 
 - 目标：一段被注入到 Typora 明文入口**最前面**的代码，使被改动过的程序仍能通过自校验，

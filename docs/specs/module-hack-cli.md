@@ -7,19 +7,22 @@
 
 ## 行为
 
-- 无参数执行：备份 → 取入口原文 → 注入 → 重新打包 → 写许可证 → 启动验收 → 报告。
+- 无参数执行（按平台能力位 `asarPatchSupported` 分流）：
+  - **asar 路线（Windows/Linux）**：备份 → 取入口原文 → 注入 → 重新打包 → 写许可证 → 启动验收 → 报告；
+  - **记录路线（macOS）**：备份许可证记录 → 伪造记录 → 启动验收 → 报告（不改动 `.app`）。
 - 安装目录不可写时（典型是 `%ProgramFiles%\Typora` / `/usr/share/typora`）：解包 / 注入 / 打包全部在用户
   临时目录里完成，最后用**一次**平台提权把「备份 + 成品」复制进安装目录，其余步骤（写许可证、启动 Typora、
-  读日志）仍以普通用户身份进行。目录可写时不提权。
-- `--dir <路径>`：显式指定 Typora 安装根目录。指向的目录里没有 `resources\app.asar` 时**直接报错退出**，
-  不回退到自动探测（显式指定必须被尊重，静默猜别处比报错更糟）。
-- `--no-verify`：跳过启动验收（仍然打补丁），并在输出中提示跳过的风险。
-- `--restore`：把 `app.asar` 从备份拷回，并清空许可证记录。
-- `--status`：只读打印安装路径、备份、入口名与是否已注入、许可证两个值、以及生效的邮箱/序列号。
-  该模式不要求许可证存储可用（未实现存储的平台照常可看状态）。
+  读验收信号）仍以普通用户身份进行。目录可写时不提权。macOS 记录路线只写用户目录，始终不需要提权。
+- `--dir <路径>`：显式指定 Typora 安装根目录。指向的路径不符合平台结构（没有 `resources\app.asar` /
+  不是 `.app` 包）时**直接报错退出**，不回退到自动探测（显式指定必须被尊重，静默猜别处比报错更糟）。
+- `--no-verify`：跳过启动验收（仍然改写），并在输出中提示跳过的风险。
+- `--restore`：把被改对象从备份拷回（asar / 许可证记录），并清空许可证记录。
+- `--status`：只读打印安装路径、目标文件、备份、状态（asar 路线：入口名与是否已注入、`SLicense`/`IDate`；
+  记录路线：许可证是否已激活、安装日期）、以及生效的邮箱/序列号。
 - `--yes` / `-y`：跳过「Typora 正在运行」的确认。
 - `--help` / `-h`：打印用法。
-- 幂等：重复执行不会重复备份；Typora 被重装/升级后，备份会自动刷新。
+- 幂等：重复执行不重复备份（记录路线的备份始终指向最早的原始记录）；asar 路线在 Typora 被重装/升级后
+  备份会自动刷新。
 - 配置：邮箱与序列号来自 `环境变量 > 仓库根目录 .env > src/config.ts 的默认值`。
 
 ## 输入 / 输出
@@ -36,26 +39,27 @@
     5. 浅扫描：平台相关的一组根目录 + 常见子目录，再退化为有深度与目录数上限的遍历
     各平台的具体候选见 spec `module-platform.md`。
   - （及其同目录备份）；
-  - 模板文件 `src/inject/patch.js`；
+  - 模板文件 `src/inject/patch.js`（仅 asar 路线）；
   - 可选的 `<repo>/.env`。
-- 输出：
-  - 覆盖后的 `app.asar`；
-  - 首次执行时产生的 `app.asar.hapora-orig.bak`；
-  - 许可证记录：Windows 为注册表 `HKCU\SOFTWARE\Typora` 的 `SLicense` / `IDate`；
-    macOS / Linux 的落点尚未确认，当前在改动任何文件之前直接失败（见 spec `module-platform.md` 与 ADR-010）；
-  - stdout 的步骤报告；
-  - 验收时启动 Typora 进程并读取平台对应的 `typora.log`（路径由平台层给出）。
+- 输出（按平台能力位 `asarPatchSupported` 分流）：
+  - **asar 路线（Windows/Linux）**：覆盖后的 `app.asar`；首次执行时产生的
+    `app.asar.hapora-orig.bak`；许可证记录写注册表 `HKCU\SOFTWARE\Typora` 的 `SLicense` / `IDate`；
+    验收时启动 Typora 进程并读取 `%APPDATA%\Typora\typora.log`。
+  - **记录路线（macOS）**：不触碰 `.app`；覆盖 `~/Library/Application Support/<bundle id>/.<指纹>`
+    并留同名 `.hapora-orig.bak` 备份；写许可证即写入该伪造记录；验收轮询记录状态与进程存活。
+  - Linux 的许可证存储尚无实证结论，在改动任何文件之前直接失败（见 ADR-010）。
+  - stdout 的步骤报告。
 
 ## 约束
 
 - 任何写操作之前必须先有可用的备份。
 - 支持的平台：Windows / macOS / 桌面 Linux。不支持的平台以非零码退出，不做降级。
-- 平台差异（定位 / 进程 / 启动 / 日志路径 / 提权 / 许可证存储）全部由 `src/platform/` 提供，
-  本入口不得出现 `process.platform` 分支之外的平台判断。
-- 许可证存储未实现的平台：**在改动任何文件之前**以非零码退出并说明原因，
-  不得产出「打了补丁却没激活」的半成品。`--status` 与 `--restore` 不受此限。
-- **只有「写安装目录」这一步可能需要管理员**：不得因为要提权就把整个 CLI 重跑一遍，
-  也不得以管理员身份去启动 Typora 或读写日志。
+- 平台差异（定位 / 进程 / 启动 / 验收探针 / 提权 / 许可证存储）全部由 `src/platform/` 提供，
+  本入口只按**能力位**（`asarPatchSupported`）分支，不得出现平台名判断。
+- 许可证存储未实现的平台（当前是 Linux）：**在改动任何文件之前**以非零码退出并说明原因，
+  不得产出「改了却没激活」的半成品。`--status` 与 `--restore` 不受此限。
+- **只有「写目标文件」这一步可能需要管理员，且仅限 asar 路线**：不得因为要提权就把整个 CLI 重跑一遍，
+  也不得以管理员身份去启动 Typora 或读验收信号。macOS 记录路线不需要任何提权。
 - 提权必须是一次性的批量动作（备份与成品在同一次 UAC 里完成），不能弹两次。
 - 提权被拒（用户在 UAC 里点「否」）→ 非零码退出并说明「什么都没写」。
 - 找到 Typora、读包、注入、打包这些步骤不得要求任何额外权限。
@@ -80,11 +84,14 @@
 - 查询不存在的注册表键是常态，`reg.exe` 的报错不得泄漏到用户终端（`stdio.stderr` 需静默）。
 - 中文 Windows 上 `reg query /ve` 的默认值标签是 `(默认)` 而非 `(Default)`：解析默认值不得依赖标签文案。
 - 注入后的长度回填导致字节数变化：报错，不打包。
-- 验收判定必须**晚于启动 ~1s 的自校验窗口**：`hasL: true` 在 ~0.1s 出现，自校验在 ~1s 才跑完，
-  仅凭 `hasL` 提前宣判会误报成功。
-- 验收只能读**最后一次启动**的日志片段：`typora.log` 会轮转，按文件长度切片会读到上一次运行的内容。
-- 验收失败且命中 `Integrity check failed` / `unfill due to renew fail`：判为补丁不兼容 → 自动回滚 + 清许可证。
-- 40s 内既无激活标记也无致命信号：判为无法判定，补丁保留并提示手动观察。
+- **[Windows] 验收判定必须晚于启动 ~1s 的自校验窗口**：`hasL: true` 在 ~0.1s 出现，
+  自校验在 ~1s 才跑完，仅凭 `hasL` 提前宣判会误报成功。
+- **[Windows] 验收只能读最后一次启动的日志片段**：`typora.log` 会轮转，按文件长度切片会读到上一次运行的内容。
+- **[macOS] 验收以记录文件状态为准**：unfill 会把记录清写成只剩 `installDate`（可观测的失败信号），
+  过了 settle 窗口仍带 `email`/`license` 键且进程存活才算成功；`--restore` 后必须还原到 hack 前的原始记录。
+- 验收失败且命中致命信号（Windows：`Integrity check failed` / `unfill due to renew fail`；
+  macOS：记录被 unfill 清除或进程退出）：判为本次改动不兼容 → 自动回滚 + 清许可证。
+- 40s 内既无激活信号也无致命信号：判为无法判定，改动保留并提示手动观察。
 
 ## 验收标准
 
@@ -106,6 +113,13 @@
 - [x] 扫描逻辑（`scanRootsForInstall`，见 `module-platform.md`）：根目录下深度 1 与深度 3 的 `Typora`
       （含 `resources\app.asar`）命中，深度 4 的与「名为 Typora 但没有 app.asar」的不命中。
 - [ ] Typora 装在非默认位置（例如 `D:\Typora`、`D:\Software\Typora`）时，不带任何参数即可被自动找到。
+- [x] **（2026-10-01 真机 · macOS arm64 / Typora 1.14.5-dev）** `pnpm hack --yes` 输出
+      `✓ 激活成功：许可证记录保持有效（email/license 键完整），Typora 存活`；不触碰 `/Applications`，无提权。
+- [x] **（真机）** macOS 记录生成物以 `NSKeyedUnarchiver` 独立验证可解出 `email`(String) /
+      `license`(String) / `installDate`(NSDate) / `lastTry`(NSDate)；许可证面板显示配置的邮箱与序列号。
+- [x] **（真机）** macOS `pnpm hack --status` 显示「已激活（邮箱）」；`pnpm hack --restore` 把记录还原为
+      hack 前的原始内容（只剩 `installDate` 且日期回到原值），重新启动即回到未激活。
+- [x] **（真机）** macOS 重复执行 `pnpm hack --yes` 幂等：沿用既有 `.hapora-orig.bak`，不重复备份。
 
 ## 完成定义
 

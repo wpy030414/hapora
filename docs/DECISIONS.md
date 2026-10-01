@@ -292,3 +292,53 @@
     与代码签名，若启用则改写 app.asar 会导致启动失败。落地前须在 arm64 真机上确认。
 - 何时重新审视：拿到 macOS / Linux 上许可证存储的实证结论后，补上 `writeLicense`；
   或在 arm64 真机上确认 asar integrity 会阻断改写时，重新评估 macOS 的可行性。
+  **（2026-10-01 更新：macOS 部分的假设已被真机实证推翻并按 ADR-011 落地，本节其余结论仍然有效。）**
+
+## ADR-011：macOS 版是原生应用，改走「伪造许可证记录文件」路线
+
+- 日期：2026-10-01
+- 状态：已采纳
+- 背景（遇到了什么问题）：
+  ADR-010 预设 macOS 版 Typora 与 Windows/Linux 同为 Electron 结构，只是许可证存储位置未知。
+  在 arm64 真机（Typora `1.14.5-dev`）上核对后发现**整个前提是错的**：macOS 版是原生
+  ObjC/AppKit + WKWebView 应用——没有 app.asar、没有明文入口、Frameworks 里只有 Sparkle，
+  许可证逻辑全在 Mach-O 的 `LicenseManager` 类里。Windows 的「注入 asar」路线在 macOS 上
+  没有任何落点，且包有 Developer ID 签名 + hardened runtime + Sealed Resources，
+  改写包内任何文件都会破坏签名。
+  （完整实证见 `docs/researches/activation-mac.md`；附带发现：现有 `locate` 以「存在 asar」为判据，
+  在 macOS 上连 Typora 都找不到。）
+- 考虑过的方案：
+  1. **伪造许可证记录文件**：逆向出 `~/Library/Application Support/<bundle id>/.<fingerprint>`
+     的格式（AES-256-CBC 加密的 NSKeyedArchive），直接写一个合法的「已激活」记录；
+  2. 二进制 patch：反汇编定位 `hasLicense` / `quickValidateLicense:`，改指令后 ad-hoc 重签名；
+  3. DYLD 注入：利用 entitlements 里的 `allow-dyld-environment-variables` 注入 hook 库。
+- 决策：采用方案 1。macOS 上 **hack 不触碰 /Applications**，只改写 `~/Library` 下的许可证记录；
+  `Platform` 增加 `asarPatchSupported` 能力位，`hack.ts` 按能力位（而非平台名）分支。
+- 为什么选这个：
+  - 方案 1 的机制基础已全部实证：密钥派生（`SHA256(IOPlatformUUID + "typora-license")`）、
+    加密形态（AES-256-CBC、零 IV、PKCS7）、文件结构（keyed archive）、指纹命名
+    （`Base64(SHA256(IOPlatformUUID))[0..10]` 清洗）、启动判定（只要 `email`/`license` 键非 nil）
+    与续期窗口（`lastTry` 距今 `[1,12)` 小时内不续期）都能在本地复现；
+  - 不动安装目录 ⇒ 无提权、无 App Management TCC、不破坏代码签名、Typora 升级不覆盖伪造
+    （升级后首启会强制续期一次，重跑 hack 即恢复，见「后果」）；
+  - 方案 2 与 ADR-006「版本无关」直接冲突：指令寻址随版本漂移，且重签名会破坏 Sparkle 更新；
+  - 方案 3 被 library validation 挡死：entitlements 有 `allow-dyld-environment-variables`，
+    但没有 `disable-library-validation`，注入非同 Team ID 的 dylib 会被内核拒绝。
+- 为什么不选其他：
+  - 方案 2 的每次 Typora 升级都要重新逆向一遍指令位置，维护成本与「一次命令激活」的目标相悖；
+  - 方案 3 需要请求开发者签名或关闭 SIP，都不在可接受范围内。
+- 后果：
+  - `hack.ts` 引入 `asarPatchSupported` 分支：asar 路线（备份/注入/打包/提权）只在
+    Windows/Linux 执行；macOS 走「备份记录文件 → 伪造 → 验收」；
+  - `Platform` 新增 `probeActivation`：Windows 读 `typora.log` 关键字，macOS 轮询记录文件是否
+    仍带激活键（unfill 会把记录物理清写）+ 进程存活——macOS 上没有可用的日志通道
+    （不存在 `typora.log`，unified log 在启动路径无输出，已实测）；
+  - 许可证存储有两套实现：Windows 注册表 + macOS 加密记录文件；Linux（Electron 版）仍显式失败；
+  - **已知限制（激活有效期）**：防线是 `lastTry` 窗口，关机的机器距上次 hack 超过 12 小时后
+    重启会触发续期，服务器对伪造序列号返回 `success=false` 会导致 unfill，需重跑 `pnpm hack`；
+    若 `.env` 里配的是真实有效的序列号，续期成功则不受此限；
+  - 记录文件的编码有两条硬约束（int marker 宽度、`NS.time` 必须 real），
+    踩错时 `NSKeyedUnarchiver` 会静默返回 nil（现象是「伪造被无视、状态未激活」且无报错），
+    已固化为研究报告 §2.3 与生成器的实现约束。
+- 何时重新审视：Typora 在 macOS 上改记录文件格式/密钥派生，或收紧续期窗口（届时验收会
+  以「记录被清除」显式失败并回滚）；或需要面向长时间不联网的机器时，评估常驻刷新组件。
