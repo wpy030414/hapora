@@ -219,3 +219,116 @@ log show --last 20s --predicate 'process == "Typora"' --info   # 无许可证相
 macOS 的「hack」与 Windows 语义对齐（让本机 Typora 进入已激活状态）但路线完全不同：
 **不触碰 `/Applications` 里的 Typora.app**（无提权、无签名破坏、升级免疫），只伪造
 `~/Library` 下的许可证记录文件。详见 `docs/DECISIONS.md` ADR-011。
+
+> **路线修订**：§4 已证明记录路线的激活有效期 = `lastTry` 窗口（约 10 小时静默失效），
+> 与 Windows 的「一次激活、永久有效」不对齐。自 ADR-012 起，macOS 改走「Mach-O 二进制补丁」
+> 路线：短路 `-[LicenseManager renew]`，配合 §10 的补丁点与重签配方实现永久激活。
+> 本节「不触碰 /Applications」的表述由 §10 / ADR-012 取代；§1–§8 的机制结论不受影响。
+
+## 10. Mach-O 补丁点与重签名（ADR-012 路线的实证依据）
+
+样本仍是 `1.14.5-dev`（build 7776）。本节全部命令对**原始**（未 hack）二进制可复现。
+
+### 10.1 补丁目标为什么是 `renew` 而不是别的
+
+- `unfillLicense` 的全部调用点：renew 回调（服务器 `success=false` / 验签失败）+ 手动输码
+  `activate:` 失败。后者是用户主动行为，不设防。
+- `quickValidateLicense:` 只在手动输码流程（全二进制唯一调用点），启动路径不经过——补它无意义。
+- 启动判定（§3）只看记录里 `email`/`license` 键非 nil，无日期逻辑 ⇒ **伪造记录仍不可省**；
+  补丁的作用只有一个：让唯一会打回激活的 `renew` 永不运行 ⇒ 记录永不过期。
+- 在方法 IMP 首指令写 `ret` 覆盖**所有** `objc_msgSend` 派发路径（调用方走 selref，
+  不存在绕过 IMP 的直连调用）；等长替换 ⇒ 任何后续指令与偏移都不漂移。
+
+### 10.2 符号定位（版本无关，无任何硬编码偏移）
+
+二进制**未剥离本地符号**，两个架构的符号表都直接给出方法 IMP 的虚拟地址：
+
+```sh
+BIN=/Applications/Typora.app/Contents/MacOS/Typora
+nm -arch arm64 -U "$BIN" | grep '\[LicenseManager renew\]'
+#   00000001000731f8 t -[LicenseManager renew]
+nm -arch x86_64 -U "$BIN" | grep '\[LicenseManager renew\]'
+#   0000000100089ed7 t -[LicenseManager renew]
+```
+
+程序化定位法则（darwin-macho.ts 的实现依据）：解析 fat 头（大端）取各切片偏移 →
+在切片内解析 `LC_SYMTAB`，按符号名精确匹配取 `n_value`（vm 地址）→ 按**包含性**映射到文件偏移
+（找 `vmaddr ≤ n_value < vmaddr+vmsize` 且 `(n_value−vmaddr) < filesize` 且可执行
+（`maxprot & 0x4`）的 `LC_SEGMENT_64`；`fileOffset = 切片偏移 + seg.fileoff + (n_value − seg.vmaddr`）。
+不按段名匹配，天然兼容 `__TEXT` / `__TEXT_EXEC` / 多 `__TEXT` 段布局。
+
+### 10.3 补丁点表与原始字节（1.14.5-dev 实测）
+
+| 切片 | vm 地址 | 文件偏移 | 原始字节 | 原指令 | 补丁字节 | 补丁指令 |
+| --- | --- | --- | --- | --- | --- | --- |
+| arm64（切片 @0x194000） | `0x1000731f8` | `0x2071f8` | `ff 83 03 d1` | `sub sp, sp, #0xe0` | `c0 03 5f d6` | `ret` |
+| x86_64（切片 @0x4000） | `0x100089ed7` | `0x8ded7` | `55` | `pushq %rbp` | `c3` | `retq` |
+
+复核命令：
+
+```sh
+otool -arch arm64  -tV "$BIN" | sed -n '/^-\[LicenseManager renew\]:/,+3p'   # 首条 sub sp,sp,#0xe0
+otool -arch x86_64 -tV "$BIN" | sed -n '/^-\[LicenseManager renew\]:/,+3p'   # 首条 pushq %rbp
+```
+
+序言安全性论证：两处 `ret` 都落在任何压栈/栈帧调整**之前**，直接原样返回（调用约定不破坏，
+`x0`/`rax` 残留值无影响——方法返回 void）。本二进制是 plain arm64（非 arm64e），
+无指针认证问题；即便未来换成 arm64e，裸 `ret` 在 IMP 入口同样成立（补丁点先于任何 `paciasp`）。
+ret 编码按 cputype 分派：arm64/arm64e（`0x…0C`）⇒ `c0 03 5f d6`；x86_64（`0x…07`）⇒ `c3`。
+
+**幂等性判定只看「目标偏移处字节是否已是 ret 模式」**，不校验被覆盖的原始内容
+（版本无关性）；被覆盖的原字节记入备份 manifest 仅供事后诊断。
+
+### 10.4 重签名配方（改包后必须；entitlements 一增一保）
+
+改写二进制后原 Developer ID 签名失效，且 arm64 macOS 内核强制要求有效签名 ⇒ 必须 ad-hoc 重签。
+两条硬约束：
+
+1. **保留原 entitlements 并只追加一项** `com.apple.security.cs.disable-library-validation`：
+   原签名无此项 ⇒ library validation 生效 ⇒ 团队签名的 `Sparkle.framework` 会被拒绝加载进
+   ad-hoc 宿主（dyld 按「同 Team 或 Apple」判）。加上此项后 Sparkle 照常加载。
+   其余三项原样保留（`allow-dyld-environment-variables` / `allow-jit` /
+   `allow-unsigned-executable-memory`）——只做最小 delta。
+2. **保持 hardened runtime**（`--options runtime`），不整个放弃 runtime（那是对原始安全姿态
+   更大的偏离）；也不用 `--deep`（会剥掉 Sparkle 自身的 Developer ID 签名，且两个 ad-hoc
+   二进制在 library validation 下同样过不了同队校验——无收益纯破坏）。
+
+```sh
+APP=/Applications/Typora.app
+# 1. 导出原 entitlements（XML plist 落 stdout，元数据落 stderr；必须在改动前导出——旧签名是唯一来源）
+codesign -d --entitlements - --xml "$APP" > /tmp/ent.xml
+grep -o '<key>' /tmp/ent.xml | wc -l   # 原始为 3（输出是单行 XML，grep -c 数的是行数，须用 -o | wc -l）
+# 2. 注入 disable-library-validation（插到最外层 </dict> 前），并 lint 把关
+#    （实现见 darwin-macho.ts：文本插入 + plutil -lint；此处手工等价）
+plutil -lint /tmp/ent2.xml     # 4 个 key 后应 OK
+# 3. ad-hoc 重签（对 bundle 整体，绝不裸签可执行文件；无 --deep / --timestamp / --identifier）
+codesign --force --sign - --options runtime --entitlements /tmp/ent2.xml "$APP"
+# 4. 验签与形态判据
+codesign --verify --strict --verbose=2 "$APP"          # … valid on disk / … satisfied its Designated Requirement
+codesign -dv "$APP" 2>&1 | grep -E 'Signature|TeamIdentifier'   # Signature=adhoc
+codesign -d --entitlements - --xml "$APP" | grep -o '<key>' | wc -l   # 4（原 3 + disable-library-validation）
+```
+
+**重签会重排胖文件布局**（切片偏移/尺寸可能变化）⇒ 一切字节复核（补丁自检、幂等判定、
+`--status`）都必须对重签后的**磁盘文件重新解析定位**，绝不复用旧偏移。
+
+### 10.5 还原 = 字节等价拷贝（无需再签）
+
+备份 `Contents/MacOS/Typora` 与 `Contents/_CodeSignature/CodeResources` 的原始字节，
+还原时逐字节拷回 ⇒ 内嵌 CodeDirectory 与资源封印都是原件 ⇒ Developer ID 签名自动恢复有效：
+
+```sh
+codesign -dv "$APP" 2>&1 | grep Authority    # 还原后重新出现 Developer ID Application: Abner Lee
+codesign --verify --strict "$APP" && echo OK
+```
+
+### 10.6 环境注意
+
+- macOS 13+ 首次由终端改写 .app 包内容会触发 TCC「App Management」一次性授权弹窗
+  （写入探测也可能触发）；拒绝后表现为 EPERM。属预期交互，不规避。
+- 若包上带 `com.apple.quarantine`（本机无），ad-hoc 签名 + 隔离属性会被 Gatekeeper 拦，
+  落盘时顺带 `xattr -d com.apple.quarantine`（防御性）。
+- 重签后 Sparkle 的应用内自动更新大概率失效（宿主 designated requirement 变为 ad-hoc）。
+  这与 Windows 路线「伪造更新检查使 asar 不被替换」语义等价：**补丁不会被自动更新静默覆盖**；
+  手动升级（下载新包覆盖）后二进制换新，重跑 `pnpm hack` 即恢复（备份状态机会识别为 refreshed）。
+- `codesign` / `plutil` / `nm` / `otool` 依赖 Xcode Command Line Tools（`xcode-select --install`）。
