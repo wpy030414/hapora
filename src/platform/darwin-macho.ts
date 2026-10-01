@@ -13,7 +13,9 @@
  * 本模块唯一允许出现的 Typora 字面量：MACHO_TARGETS 里的选择器符号名，以及各 CPU 的 ret 编码。
  */
 
-/* ---------------- fat / Mach-O 解析（纯函数） ---------------- */
+import { spawnSync } from "node:child_process";
+
+/* ---------------- Mach-O 解析（纯函数） ---------------- */
 
 /** 补丁目标：逆向所得的方法符号名（LC_SYMTAB 里做精确匹配）。 */
 export const MACHO_TARGETS = {
@@ -263,4 +265,89 @@ export function applyPatches(buf: Buffer, ops: PatchOp[]): Buffer {
 /** 读取当前状态：每个 (名字 × 切片) 的入口是否已是 ret 模式（幂等判定；不校验被覆盖的原始内容）。 */
 export function readPatchState(buf: Buffer, names: string[]): Array<{ site: SymbolSite; patched: boolean }> {
   return planRetPatches(buf, names).map((op) => ({ site: op.site, patched: op.current.equals(op.patch) }));
+}
+
+/* ---------------- entitlements 与 codesign ---------------- */
+
+/** 重签时要追加的唯一 entitlement（研究报告 §10.4 的硬约束之一）。 */
+const ENT_DISABLE_LIB_VALIDATION = "com.apple.security.cs.disable-library-validation";
+
+/** 跑外部工具；不抛错，成败与 stdout/stderr 交给调用方（codesign -dv 的元数据在 stderr）。 */
+function runTool(cmd: string, args: string[]): { ok: boolean; stdout: string; stderr: string } {
+  const r = spawnSync(cmd, args, { encoding: "utf-8" });
+  if (r.error) {
+    return {
+      ok: false,
+      stdout: "",
+      stderr: `无法执行 ${cmd}（${r.error.message}）——需要 Xcode Command Line Tools（xcode-select --install）`,
+    };
+  }
+  return { ok: r.status === 0, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+
+/**
+ * 从当前有效签名导出 entitlements（XML plist）。
+ * 必须在改动二进制之前调用——旧签名是唯一可靠来源；二进制内的 DER blob 格式无契约，不解析。
+ */
+export function dumpEntitlementsXml(appDir: string): string {
+  const r = runTool("codesign", ["-d", "--entitlements", "-", "--xml", appDir]);
+  if (!r.ok) throw new Error(`导出 entitlements 失败：${r.stderr.trim()}`);
+  const start = r.stdout.indexOf("<?xml");
+  if (start < 0) throw new Error("codesign 未输出 XML entitlements（原签名可能没有 entitlements）");
+  return r.stdout.slice(start);
+}
+
+/**
+ * 幂等追加 disable-library-validation：插到**最外层** `</dict>`（最后一个）之前。
+ * 纯文本变换（5 行、保形），合法性由 lintPlistFile 在使用前把关——不引入 plist 解析器。
+ */
+export function withDisableLibraryValidation(xml: string): string {
+  if (xml.includes(ENT_DISABLE_LIB_VALIDATION)) return xml;
+  const last = xml.lastIndexOf("</dict>");
+  if (last < 0) throw new Error("entitlements 里没有 </dict>，结构意外");
+  const inject = `<key>${ENT_DISABLE_LIB_VALIDATION}</key><true/>`;
+  return xml.slice(0, last) + inject + xml.slice(last);
+}
+
+/** `plutil -lint` 把关：插入后的 entitlements 必须是合法 plist 才允许交给 codesign。 */
+export function lintPlistFile(path: string): void {
+  const r = runTool("plutil", ["-lint", path]);
+  if (!r.ok) throw new Error(`entitlements 文件不是合法 plist：${(r.stdout + r.stderr).trim()}`);
+}
+
+/**
+ * ad-hoc 重签（对 bundle 整体，绝不裸签可执行文件）。
+ * 配方（研究报告 §10.4）：保留原 entitlements + 追加 disable-library-validation、保持 hardened runtime；
+ * 刻意不用 --deep（会剥掉 Sparkle 的 Developer ID 签名）/ --timestamp（ad-hoc 无意义）/ --identifier。
+ */
+export function resignAdhoc(appDir: string, entFile: string): void {
+  const r = runTool("codesign", [
+    "--force", "--sign", "-", "--options", "runtime", "--entitlements", entFile, appDir,
+  ]);
+  if (!r.ok) {
+    throw new Error(`ad-hoc 重签失败：${(r.stdout + r.stderr).trim()}\n  二进制已改但重签失败，应立即从备份还原。`);
+  }
+}
+
+/** `codesign --verify --strict`。对嵌套框架同样成立（Sparkle 未被触碰、原签名仍有效）。 */
+export function verifyStrict(appDir: string): boolean {
+  return runTool("codesign", ["--verify", "--strict", "--verbose=2", appDir]).ok;
+}
+
+/** 签名形态：ad-hoc（hapora 重签过）/ developer-id（原始）/ unknown。每次现跑，绝不缓存。 */
+export function signatureKind(appDir: string): "developer-id" | "adhoc" | "unknown" {
+  // 新版 codesign 默认档不打印 Signature=/Authority= 行，须 --verbose=2 以上
+  const r = runTool("codesign", ["-dv", "--verbose=2", appDir]);
+  if (!r.ok) return "unknown";
+  const meta = r.stdout + r.stderr;
+  if (meta.includes("Signature=adhoc")) return "adhoc";
+  if (meta.includes("Authority=Developer ID Application:")) return "developer-id";
+  return "unknown";
+}
+
+/** 带 quarantine 的 ad-hoc 应用会被 Gatekeeper 拦：有则删（防御性；正常安装的本机应用没有）。 */
+export function removeQuarantine(appDir: string): boolean {
+  const probe = runTool("xattr", ["-p", "com.apple.quarantine", appDir]);
+  if (!probe.ok) return false;
+  return runTool("xattr", ["-d", "com.apple.quarantine", appDir]).ok;
 }
