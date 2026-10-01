@@ -12,10 +12,12 @@ Linux（Electron 版）的许可证存储尚无实证结论，会在改动任何
 - **两套平台机制**（Typora 在两端根本不是同一种程序）：
   - **Windows / Linux（Electron 版）**：改包内明文入口 `launch.dist.js`，在进程内接管
     许可证校验链路与更新检查链路（补丁 + 写注册表）。
-  - **macOS（原生版）**：目标是原生 AppKit + WebKit 应用，没有 asar 也没有可注入的入口。
-    改为**只伪造许可证记录文件**：向 `~/Library/Application Support/<bundle id>/` 写一个
-    按其原生格式（AES 加密的 keyed archive）加密的「已激活」记录——**完全不触碰 `/Applications`**，
-    不需要提权，也不破坏代码签名。
+  - **macOS（原生版）**：原生 AppKit + WebKit 应用，没有 asar 也没有可注入的入口。
+    走 **Mach-O 二进制补丁路线**（ADR-012）：在二进制 `-[LicenseManager renew]`（唯一会把
+    激活打回的续期入口）写等长的 `ret` 指令使其永不运行，ad-hoc 重签名（entitlements 原样保留 +
+    追加 `disable-library-validation`），再伪造 `~/Library` 下的许可证记录文件——
+    **一次激活、永久有效**，与 Windows 语义对齐；原始二进制与签名备份在包外，`--restore`
+    逐字节还原即恢复官方 Developer ID 签名。
 
 ## 为什么存在？
 
@@ -63,20 +65,22 @@ CODE=POWER0-ED0000-BY0000-XRL000
   - Windows/Linux：入口文件名从包内 `package.json` 的 `main` 读取，注入位置固定在文件最前面，
     自校验基准在打包时按实际内容现算，**不针对某个 Typora 版本写死任何常量**；
   - macOS：bundle id 与可执行名读自 `Info.plist`，记录文件名由本机 `IOPlatformUUID` 派生，
-    同样不写死版本常量；
+    Mach-O 补丁点运行时解析符号表定位（**零硬编码偏移**）；
   - 换版本后若结构不兼容，`pnpm hack` 会验收失败并自动回滚，不会留下坏状态。
 - 验收判据（全部由 `pnpm hack` 现场产生，仓库不携带任何截图）：
   - **Windows/Linux**：`typora.log` 中出现 `[L] pass` 与 `[watch L] hasL: true`；出现
     `[renewLicense]: license renewed`，且**不出现** `Integrity check failed`、`onUnfillLicense`；
     启动约 1s 的自校验窗口过去后进程仍在；主窗口无 `UNREGISTERED` 水印。
-  - **macOS**：启动 Typora 后，许可证记录文件仍完整携带 `email`/`license` 键（被 unfill 时
-    Typora 会把记录清除，这是可观测的失败信号），且进程存活；`--restore` 能把记录还原到
-    hack 之前的原始状态。
+  - **macOS**：双架构 `renew` 入口首指令为 `ret`/`retq`；`codesign --verify --strict` 通过
+    （ad-hoc）；启动后许可证记录文件仍完整携带 `email`/`license` 键且进程存活——记录的
+    `lastTry` 落在续期窗口**之外**，存活本身就是 `renew` 已被短路的自证；`--restore` 能把
+    二进制与记录逐字节还原（Developer ID 签名自愈）。
 - 已知限制：
-  - **macOS 的激活有效期受续期窗口约束**：Typora 客户端只在 `lastTry` 距今超出 1–12 小时窗口时
-    才向服务器续期，伪造记录把 `lastTry` 设在窗口内以避免被服务器打回。因此**关机超过 12 小时后
-    首次启动会触发续期并可能失效**，重跑 `pnpm hack` 即恢复；若 `.env` 里配的是真实有效的序列号，
-    续期会成功、不受此限。
+  - **macOS 手动升级 Typora 后补丁失效**：升级会换掉二进制，下一次启动立刻可见地被打回
+    （`lastTry` 金丝雀使失效可见而非静默），重跑 `pnpm hack` 即恢复（备份状态机自动刷新）。
+    ad-hoc 重签后 Sparkle 应用内自动更新大概率失效——这与 Windows 路线「伪造更新检查」
+    语义等价：补丁不会被自动更新静默覆盖；需要升级时手动下载。
+    首次改包会触发一次 macOS 的「App Management」授权弹窗。
   - Linux（Electron 版）的许可证存储尚无实证结论，会在改动文件**之前**直接失败，而不是留下半成品。
   - 不支持 AppImage（只读镜像）。
   - 伪造的许可证载荷字段名（Windows：`deviceId` / `fingerprint` / `email` / `license` /
@@ -93,7 +97,8 @@ CODE=POWER0-ED0000-BY0000-XRL000
   - Windows/Linux：注入 `launch.dist.js`（asar 内唯一的明文入口），在
     `require("./atom.compiled.dist.jsc")` 之前挂接 `crypto.publicDecrypt`、`crypto.createHash`
     与 `electron.net.request`；
-  - macOS：自研 binary plist 编解码器 + `crypto` 的 AES-256-CBC，生成/读取与 Typora 完全同构的
-    许可证记录文件（详见 `docs/researches/activation-mac.md`）。
+  - macOS：自研 fat/Mach-O 最小解析器（运行时在符号表里定位 `-[LicenseManager renew]` 的 IMP，
+    等长写入 `ret`，arm64/x86_64 双架构）+ entitlements 导出注入与 `codesign` 重签封装 +
+    binary plist 编解码器与 AES-256-CBC 记录伪造（详见 `docs/researches/activation-mac.md` §10）。
 
 详细设计见 `docs/`。

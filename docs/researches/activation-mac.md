@@ -132,13 +132,13 @@ self._licenseDict[@"lastTry"] = now;           // 只改内存
 3. **`1 ≤ hours(lastTry→now) < 12` 内不发请求**；`< 1h`、`≥ 12h`、`lastTry` 缺失、版本升级首启
    都会发起续期。任何静态的 `lastTry` 值都会随时间滑出窗口，单靠它不是长期解。
 
-### 伪造配方（本仓库 darwin 实现的依据）
+### 伪造配方（ADR-012 路线：二进制补丁 + 记录伪造双管齐下）
 
 ```
 dict = {
   email:       <NSString，来自 .env / 默认值>,
   license:     <NSString，展示用序列号 —— 启动判定只看非 nil，不校验内容>,
-  lastTry:     <NSDate = now - 2h —— 落在「1 ≤ hours < 12」窗口，启动时干脆不发请求>,
+  lastTry:     <NSDate = now - 48h（金丝雀，刻意落在 [1,12) 窗口之外）>,
   installDate: <保留原值>,
   ...其余原有键原样保留（如 finger）...
 }
@@ -146,13 +146,15 @@ dict = {
 
 防线的机制边界（实测结论）：
 
-- `lastTry` 窗口是**唯一有效**的防线：窗口内不发 renew，激活保持。
+- 记录路线时代的主防线是「`lastTry` 落在窗口内不发请求」，但任何静态值都会随时间滑出窗口
+  ——**单靠记录不是长期解**（这正是 ADR-012 改走二进制补丁的动因）。
 - 曾尝试的第二道防线「`license` 用非字符串类型污染请求体，使 renew 序列化失败」**已被证伪**：
   请求体为空时服务器仍可能回 `200`，`sendPost` 判定 `statusCode == 200` 为真而响应体解析为空串，
   `resp[@"success"]` 为 nil ⇒ 仍走 `unfill`。该污染还会让许可证面板的序列号一栏显示为空，故已弃用。
-- 因此激活有效期 = `lastTry` 窗口长度：**关机的机器在距上次 hack 超过 12 小时后重启会重新续期**，
-  服务器对伪造序列号返回 `success=false` ⇒ `unfill` ⇒ 重跑 `pnpm hack` 即恢复。
-  若 `.env` 配的是**真实有效**的序列号，续期会成功，则不受该窗口限制。
+- **现行防线（ADR-012）**：二进制补丁短路 `renew`（§10），记录永不过期。`lastTry = now − 48h`
+  金丝雀的价值：(a) 窗口外的记录存活本身就是「renew 已被中和」的自证（每次 hack 验收自动证明）；
+  (b) 补丁因升级失效时，下一次启动**立刻可见地** unfill，而非 10 小时后静默过期。
+  若 `.env` 配的是**真实有效**的序列号，续期会成功，本就不受该窗口限制。
 
 ## 5. 本地校验算法（仅供输码流程，伪造不需要，但记录备查）
 
@@ -182,7 +184,7 @@ activate / renew 的**服务器响应**时）。**启动读取路径不验签**�
 | 本地判定 | RSA `publicDecrypt` 出 JSON，fingerprint 逐字符硬校验 | dict 里 `email`/`license` 键非 nil 即可 |
 | fingerprint | `Base64(SHA256(MachineGuid+"typora"))[0..10]` 清洗 | `Base64(SHA256(IOPlatformUUID))[0..10]` 清洗，兼作记录文件名 |
 | 续期失败 | 即 unfill | 网络/非 200 宽容；仅 `success=false` 或验签失败 unfill |
-| 自校验 | 启动 ~1s 后 sha256 校验入口文件 | 无（改不动二进制也无需绕过） |
+| 自校验 | 启动 ~1s 后 sha256 校验入口文件 | 无（无需绕过；改的是二进制本身，无完整性自检） |
 | 验收日志 | `%APPDATA%\Typora\typora.log` | 无文件日志；unified log 在启动路径无输出 ⇒ 本仓库改用「记录文件状态轮询」验收 |
 
 ## 8. 可复现判据

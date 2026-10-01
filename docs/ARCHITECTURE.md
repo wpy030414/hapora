@@ -10,8 +10,8 @@
                  ┌───────▼────────┐
                  │  src/hack.ts   │  编排（按能力位分支）：
                  └───┬────────┬───┘
-                     │        │  [asar 路线] 备份 → 注入 → 打包(临时) → 落盘 → 写许可证 → 验收
-                     │        └─ [记录路线] 备份记录 → 伪造记录 → 验收
+                     │        │  [asar 路线]  备份 → 注入 → 打包(临时) → 落盘 → 写许可证 → 验收
+                     │        └─ [Mach-O 路线] 记录备份 → 二进制补丁+重签(事务) → 伪造记录 → 验收
         ┌────────────┘
         ▼
 ┌──────────────────┐                 ┌─────────────────┐
@@ -26,16 +26,19 @@
 │          linux                 │  └──────────────────────────┘
 │ types / scan / unix：公共契约   │  ┌──────────────────────────┐
 │ darwin-license：macOS 记录文件  │  │ src/registry.ts          │
-└────────┬───────────────────────┘  │ （Windows 许可证存储）      │
-         │                          └──────────────────────────┘
+│ darwin-macho：Mach-O 补丁/重签  │  │ （Windows 许可证存储）      │
+└────────┬───────────────────────┘  └──────────────────────────┘
+         │
          ├── [asar 路线] ──▶ <安装目录>/resources/app.asar          ←─ 覆盖
          │                   <安装目录>/resources/app.asar.hapora-orig.bak  ← 首次创建
-         └── [记录路线] ──▶ ~/Library/Application Support/<bundle id>/.<指纹>       ←─ 覆盖
+         ├── [Mach-O 路线] ─▶ <.app>/Contents/MacOS/<可执行>        ←─ 覆盖（ret 补丁）
+         │                   <.app>.hapora-orig.bak/               ← 首次创建（包外：二进制+CodeResources+entitlements+manifest）
+         └── [记录/Mach-O] ─▶ ~/Library/Application Support/<bundle id>/.<指纹>       ←─ 覆盖
                             ~/Library/Application Support/<bundle id>/.<指纹>.hapora-orig.bak
 ```
 
 两条路线对应两类被改对象：Windows/Linux 是 Electron 应用的 `app.asar`（补丁接管进程内校验链），
-macOS 是原生应用的许可证记录文件（只伪造存储，不动安装包，见 ADR-011）。
+macOS 是原生应用的 Mach-O 二进制 + 许可证记录文件（短路 `renew` 使记录永不过期，见 ADR-012）。
 
 `src/asar.ts`（解包 / 打包 / 读 `main`）只被 asar 路线使用，与平台无关，故不画入上图。
 
@@ -52,12 +55,13 @@ Typora 主进程
    fs.* / crypto.createHash   publicDecrypt   electron.net.request
    （自校验放行，双层）        （许可证接管）   （续期 / 更新接管）
 
-[记录路线 · macOS]
-Typora 原生进程
+[Mach-O 路线 · macOS]
+Typora 原生进程（补丁后）
   └─ LicenseManager readLicenseInfo
        └─ AES 解密 ~/Library/.../.<指纹> → keyed archive 字典
             └─ email/license 键存在 ⇒ 已激活（不校验内容、不验签）
-                 └─ renew：仅当 lastTry 距今 [1,12) 小时之外才发起（伪造时落在窗口内，不发）
+                 └─ renew → ret（IMP 首指令被短路，永不运行、不发请求）
+                      （记录 lastTry=now−48h 金丝雀：窗口外存活本身即补丁生效的自证）
 ```
 
 ## 核心模块
@@ -70,8 +74,9 @@ Typora 原生进程
 | `src/platform/types.ts` | 平台契约（`Platform` 接口）、安装信息的构造与校验、写入权限探测、外部命令封装。 |
 | `src/platform/scan.ts` | 平台无关的「浅扫描」兜底：在给定根目录下找安装目录，带深度与目录数上限。 |
 | `src/platform/windows.ts` | Windows 实现：注册表 App Paths/文件关联/卸载表 + PATH + 默认目录 + 盘符浅扫描；`tasklist`/`taskkill`；UAC 提权；许可证写注册表。 |
-| `src/platform/darwin.ts` | macOS 实现：Spotlight(`mdfind`) + `/Applications`、`~/Applications`；`.app` 包解析（bundle id 与可执行名读自 Info.plist）；`pgrep`/`pkill`；**不走 asar 路线**，许可证走记录文件、验收走记录轮询。 |
-| `src/platform/darwin-license.ts` | macOS 许可证记录文件的编解码与伪造：binary plist 最小编解码器、keyed archive 组装、AES 加解密、指纹/密钥派生、伪造配方。 |
+| `src/platform/darwin.ts` | macOS 实现：Spotlight(`mdfind`) + `/Applications`、`~/Applications`；`.app` 包解析（bundle id 与可执行名读自 Info.plist）；`pgrep`/`pkill`；**走 Mach-O 路线**：二进制补丁 + 记录伪造，验收走记录轮询。 |
+| `src/platform/darwin-license.ts` | macOS 许可证记录文件的编解码与伪造：binary plist 最小编解码器、keyed archive 组装、AES 加解密、指纹/密钥派生、伪造配方（lastTry 金丝雀）。 |
+| `src/platform/darwin-macho.ts` | macOS Mach-O 补丁：fat/符号表解析与补丁点定位（零硬编码偏移）、ret 补丁生成、entitlements 导出注入、codesign 重签封装、包外备份与事务化落地（状态机 + 失败紧急还原）。 |
 | `src/platform/linux.ts` | Linux 实现：`which typora` + `/usr/share/typora` 等 + Flatpak/Snap；`pgrep`/`pkill`；`sudo -n` 提权；许可证未实现（显式失败）。 |
 | `src/asar.ts` | `app.asar` 的解包 / 打包 / 读单文件，以及从包内 `package.json` 读 `main`。 |
 | `src/patch.ts` | 补丁模板的加载与占位符渲染；把补丁注入到入口文件最前面；定义许可证值格式。 |
@@ -105,26 +110,32 @@ Typora 原生进程
    不可写就只对这一步做一次平台提权（Windows 一次 UAC / Unix `sudo -n`）批量完成这两次复制。
 7. **写许可证**：
    - Windows：`SLicense = base64("@@HAPORA_LICENSE@@") + "#0#" + M/D/YYYY`、`IDate = M/D/YYYY`（注册表，用户级，无需提权）；
-   - macOS：往 `~/Library/Application Support/<bundle id>/.<指纹>` 写 AES 加密的 keyed archive 字典
-     （`email` + `license` + `lastTry=now-2h` + 保留 `installDate`），不需要提权；
+   - macOS（Mach-O 路线的第 2 步在 `darwin-macho.ts` 内事务化完成）：解析符号表定位
+     `-[LicenseManager renew]`（每个切片都必须命中，否则写盘前退出）→ 导出 entitlements 并追加
+     `disable-library-validation` → 临时目录 stage 补丁后二进制 → 一次性落盘
+     （包外备份 → 覆盖 → 恢复执行位 → ad-hoc 重签）→ 对重签后的磁盘文件重新解析复检；
+     随后往 `~/Library/Application Support/<bundle id>/.<指纹>` 写 AES 加密的 keyed archive 字典
+     （`email` + `license` + `lastTry=now−48h` 金丝雀 + 保留 `installDate`），不需要提权；
    - Linux：在改动任何文件之前就失败（存储位置未确认，见 ADR-010）。
 8. **验收**（启动 Typora 后轮询平台探针 `probeActivation`）：
    - Windows：只读最后一次启动的 `typora.log` 片段，等过启动 ~1s 的自校验窗口；
      命中 `hasL: true` 且无致命信号判成功；命中 `Integrity check failed` / `unfill due to renew fail`
      判「补丁导致的失败」；
    - macOS：轮询记录文件是否仍带 `email`/`license` 键（unfill 会把记录物理清写成只剩 `installDate`）
-     与进程是否存活，过了 settle 窗口仍完整即判成功；
-   - 判定为「可归因失败」时自动回滚（还原备份 + 清许可证）。
+     与进程是否存活，过了 settle 窗口仍完整即判成功——记录的 `lastTry` 落在续期窗口之外，
+     存活本身就是 renew 已被短路的自证；
+   - 判定为「可归因失败」时自动回滚（还原二进制与签名备份 + 还原记录 + 清许可证）。
 
 ## 外部系统
 
 | 外部系统 | 交互方式 | 说明 |
 |----------|----------|------|
 | Typora 安装目录（asar 路线） | 直接改文件 | 仅 Windows/Linux：`app.asar` 被整体替换，原始文件留在同目录的 `.hapora-orig.bak`；目录不可写时这一步需要一次平台提权 |
-| 许可证记录文件（记录路线） | 直接改文件 | 仅 macOS：`~/Library/Application Support/<bundle id>/.<指纹>` 被替换为伪造记录，原始文件备份为同名的 `.hapora-orig.bak`；用户目录恒可写，**无需提权、不触碰 /Applications** |
-| 许可证存储 | Windows：`reg.exe`；macOS：无外部命令 | Windows 写 `HKCU\SOFTWARE\Typora` 的 `SLicense` / `IDate`；macOS 加密由 Node 内置 `crypto` 完成；Linux 尚未实现 |
+| Typora .app 包（Mach-O 路线） | 直接改文件 + `codesign` | 仅 macOS：`Contents/MacOS/<可执行>` 被 ret 补丁后覆盖、包被 ad-hoc 重签；原始二进制 + `CodeResources` + entitlements 备份到**包外** `<.app>.hapora-orig.bak/`；`--restore` 逐字节拷回即恢复 Developer ID 原始签名（自愈，无需再签）。首次改包会触发一次 TCC「App Management」弹窗 |
+| 许可证记录文件（Mach-O 路线） | 直接改文件 | 仅 macOS：`~/Library/Application Support/<bundle id>/.<指纹>` 被替换为伪造记录，原始文件备份为同名的 `.hapora-orig.bak`；用户目录恒可写，**永远走用户态**（不混入二进制的提权批次） |
+| 许可证存储 | Windows：`reg.exe`；macOS：`codesign`/`plutil`/`ioreg` 等外部命令 | Windows 写 `HKCU\SOFTWARE\Typora` 的 `SLicense` / `IDate`；macOS 的记录加解密由 Node 内置 `crypto` 完成，Mach-O 路线用 `codesign` 重签/验签、`plutil` lint；Linux 尚未实现 |
 | Typora 自身日志 | Windows 只读 | asar 路线的验收读 `%APPDATA%\Typora\typora.log`；macOS 无日志可用，改读记录文件状态 |
-| 网络 | **不交互** | asar 路线在进程内截断请求；记录路线靠 `lastTry` 窗口让客户端不发起续期 |
+| 网络 | **不交互** | asar 路线在进程内截断请求；Mach-O 路线让 `renew` 根本不运行——本工具自身不发起任何网络请求 |
 
 ## 重要技术边界
 
@@ -144,19 +155,23 @@ Typora 原生进程
 - **伪造载荷的 `fingerprint` 必须逐字符匹配**：客户端会拿 `Base64(SHA256(MachineGuid + "typora"))[0..10]`
   再跑一次 `.replace(/[/=+-]/g, "a")`，与许可证里的值做相等比较；漏掉末尾那次替换，
   补丁会在一半的机器上静默失效（`no info` / `onUnfillLicense`，且没有任何错误日志）。详见研究报告 §4.1。
-- **提权只用于「往安装目录写文件」**：解包、注入、打包、写许可证、启动 Typora、读日志全都不需要提权；
-  提权只发生在 `installFiles()` 里，且是「备份 + 成品」一次性完成的一次提权
-  （Windows 一次 UAC，macOS/Linux 一次 `sudo -n`）。详见 ADR-008。
+- **提权只用于「往安装目录写文件」**：解包、注入、打包、补丁生成、entitlements 准备、写许可证、
+  启动 Typora、读日志全都不需要提权；提权只发生在 `installFiles()` / `elevatedRun()` 里，
+  且是「备份 + 成品（+ Mach-O 路线的重签）」一次性完成的一次提权
+  （Windows 一次 UAC，Unix 一次 `sudo -n`）。详见 ADR-008。
 - **平台差异只允许出现在 `src/platform/`**：定位、进程、启动、验收探针、写入与提权、许可证存储
-  这六件事之外，其余逻辑必须平台无关；`hack.ts` 里按**能力位**（`asarPatchSupported`）分支，
-  不出现平台名。详见 ADR-010 / ADR-011。
+  这六件事之外，其余逻辑必须平台无关；`hack.ts` 里按**能力位**（`asarPatchSupported` /
+  `machoPatchSupported`）分支，不出现平台名。详见 ADR-010 / ADR-012。
 - **定位不是「只认几个默认目录」**：按成本从低到高汇集候选（显式指定 → 注册表/Spotlight/`which` →
   PATH → 默认目录 → 卸载表 → 浅扫描），命中即止，每个候选都以平台自己的结构判据为准
   （Windows/Linux：目录下有 `resources/app.asar`；macOS：`.app` 包结构）。详见 ADR-009。
 - **未实现的平台必须显式失败**：许可证存储没有实证结论的平台（当前是 Linux）在改动任何文件
   **之前**就退出，而不是猜一个位置写进去 —— 「打了补丁却没激活」比直接失败更难排查。详见 ADR-010。
-- **macOS 不碰安装包**：记录路线只写用户目录下的许可证记录；安装目录的 Developer ID 签名
-  （hardened runtime + Sealed Resources）保持完好，也不需要 App Management TCC 授权。详见 ADR-011。
+- **macOS 改包但全程可逆**（ADR-012）：Mach-O 路线改写 .app 内的二进制并 ad-hoc 重签
+  （entitlements 原样保留 + 追加 `disable-library-validation`）；原始二进制 + `CodeResources`
+  备份在包外，`--restore` 逐字节拷回即恢复 Developer ID 原始签名（自愈，无需再签）。
+  补丁点零硬编码（运行时解析符号表）、等长替换、重签后对磁盘文件重新定位复检。
+  首次改包会触发一次 TCC「App Management」授权弹窗。详见研究报告 §10。
 - **macOS 的密钥/指纹是设备派生的**：`指纹 = Base64(SHA256(IOPlatformUUID))[0..10]`（`/=+-` 替换为 `a`），
   记录文件名即指纹；`key = SHA256(IOPlatformUUID + "typora-license")`。见研究报告 `activation-mac.md` §2。
 - **macOS 记录文件的编码有两条硬约束**：int marker 低 4 位是 log2(字节数)；`NS.time` 必须 real。
