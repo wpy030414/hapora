@@ -454,22 +454,35 @@ export function writeRecord(path: string, uuid: string, record: LicenseRecord): 
 }
 
 /**
- * 生成伪造记录（研究报告 §4 的配方）：
+ * 伪造记录的 lastTry 回拨小时数（金丝雀）。
+ *
+ * 48：刻意落在「1 ≤ hours < 12」续期窗口**之外**——二进制补丁生效时 renew 永不运行，
+ *   此值不参与任何判定；它的价值在于：
+ *   (a) 每次 hack 的验收自动证明补丁生效（窗口外的记录存活 = renew 确实被短路）；
+ *   (b) 补丁因 Typora 升级等原因失效时，下一次启动**立刻可见地**被打回（unfill），
+ *       而不是 10 小时后静默过期（ADR-012）。
+ * 改这里必须同步 ADR-012 与 docs/researches/activation-mac.md。
+ */
+export const LAST_TRY_HOURS_AGO = 48;
+
+/**
+ * 生成伪造记录：
  *   email / license 键非 nil        ⇒ 启动判定（readLicenseInfo）通过；
- *   lastTry = now - 2h              ⇒ 落在「1 ≤ hours < 12」的不续期窗口，启动时干脆不发请求
- *                                      （这是防止续期被服务器拒绝后 unfill 的主防线）；
+ *   lastTry = now - lastTryHoursAgo ⇒ 金丝雀（见 LAST_TRY_HOURS_AGO；补丁路线下不参与判定，
+ *                                      窗口外的记录存活本身就是 renew 已被中和的自证）；
  *   license 用真实字符串            ⇒ 许可证面板正常显示序列号（它只是展示值，启动不校验内容）。
  * 原有键（installDate / finger 等）原样保留，保证与 Typora 自己的写入互不干扰。
  */
 export function buildForgedRecord(
   input: { email: string; licenseCode: string; now: Date },
   existing: LicenseRecord | null,
+  lastTryHoursAgo: number,
 ): LicenseRecord {
   const rec = new Map(existing ?? []);
-  const twoHoursAgo = new Date(input.now.getTime() - 2 * 3600 * 1000);
+  const lastTry = new Date(input.now.getTime() - lastTryHoursAgo * 3600 * 1000);
   rec.set("email", input.email);
   rec.set("license", input.licenseCode);
-  rec.set("lastTry", twoHoursAgo);
+  rec.set("lastTry", lastTry);
   if (!rec.has("installDate")) rec.set("installDate", input.now);
   rec.delete("failedCounts");
   return rec;

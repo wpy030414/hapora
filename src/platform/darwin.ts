@@ -2,13 +2,15 @@
  * macOS 平台实现（arm64）。
  *
  * macOS 版 Typora 是原生 AppKit+WebKit 应用（非 Electron、无 asar，机制实证见
- * docs/researches/activation-mac.md）。因此本平台：
- *   - 「安装根目录」= .app 包，可执行文件名从 Info.plist 的 CFBundleExecutable 读取；
- *   - 被改写的目标不是 app.asar，而是 ~/Library/Application Support/<bundle id>/.<fingerprint>
- *     许可证记录文件（AES 加密的 keyed archive，读写见 darwin-license.ts）——完全不触碰
- *     /Applications，无需提权，不破坏代码签名；
- *   - 启动验收不读日志（macOS 版没有 typora.log，unified log 在启动路径无输出），
- *     而是轮询记录文件是否仍带激活键（unfill 会物理清写记录）+ 进程存活。
+ * docs/researches/activation-mac.md）。路线（ADR-012）＝ Mach-O 补丁 + 记录伪造双管齐下：
+ *   - Mach-O 补丁（darwin-macho.ts）：在 `-[LicenseManager renew]` 的 IMP 写 ret，
+ *     断掉唯一会把激活打回的续期路径，改包后 ad-hoc 重签（entitlements 原样保留 +
+ *     追加 disable-library-validation）。首次改包会触发 macOS 13+ 的 TCC
+ *     「App Management」一次性授权弹窗，属预期交互。
+ *   - 记录伪造（darwin-license.ts）：激活判定本身只看记录里 email/license 键非 nil，
+ *     仍需伪造 ~/Library 下的许可证记录文件（lastTry 金丝雀见 LAST_TRY_HOURS_AGO）。
+ *   - 启动验收：轮询记录文件是否仍带激活键 + 进程存活（窗口外 lastTry 的记录存活
+ *     本身就是 renew 已被中和的自证）。
  */
 
 import { existsSync } from "node:fs";
@@ -19,8 +21,9 @@ import { tryExec, type TyporaInstall } from "./types.js";
 import { createUnixPlatform, type UnixSpec } from "./unix.js";
 import type { ScanSpec } from "./scan.js";
 import {
-  buildForgedRecord, machineUuid, readRecord, recordLooksActivated, recordPath, writeRecord,
+  buildForgedRecord, LAST_TRY_HOURS_AGO, machineUuid, readRecord, recordLooksActivated, recordPath, writeRecord,
 } from "./darwin-license.js";
+import { applyMachOPatch, inspectMacho } from "./darwin-macho.js";
 
 let recordPathCache: string | null = null;
 
@@ -87,6 +90,12 @@ const spec: UnixSpec = {
 
   asarPatchSupported: false,
 
+  // machoPatchSupported 由 hack 路线切换的提交点亮；实现先行（暗态不可达）
+  macho: {
+    machoInspect: (install) => inspectMacho(install),
+    machoApplyPatch: (install, opts) => applyMachOPatch(install, opts),
+  },
+
   candidates() {
     const dirs: string[] = [];
     // Spotlight：能找到装在任何位置的 .app
@@ -134,7 +143,7 @@ const spec: UnixSpec = {
       const uuid = machineUuid();
       if (!uuid) throw new Error("读不到 IOPlatformUUID，无法派生记录密钥");
       const existing = readRecord(path, uuid);
-      writeRecord(path, uuid, buildForgedRecord(input, existing));
+      writeRecord(path, uuid, buildForgedRecord(input, existing, LAST_TRY_HOURS_AGO));
     },
 
     clearLicense() {

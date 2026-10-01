@@ -14,6 +14,13 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
+
+import { BACKUP_SUFFIX, tryExec, type CopyJob, type MachoApplyResult, type MachoInspection, type TyporaInstall } from "./types.js";
+import { elevatedRun, shellQuote } from "./unix.js";
 
 /* ---------------- Mach-O 解析（纯函数） ---------------- */
 
@@ -350,4 +357,250 @@ export function removeQuarantine(appDir: string): boolean {
   const probe = runTool("xattr", ["-p", "com.apple.quarantine", appDir]);
   if (!probe.ok) return false;
   return runTool("xattr", ["-d", "com.apple.quarantine", appDir]).ok;
+}
+
+/* ---------------- 备份布局 / 状态机 / 事务化落地 ---------------- */
+
+/** 包外同级备份目录（复用 BACKUP_SUFFIX）：/Applications/Typora.app.hapora-orig.bak/ */
+export function machoBackupDir(appDir: string): string {
+  return appDir + BACKUP_SUFFIX;
+}
+
+/** 备份清单。偏移字段仅作诊断；还原与幂等只信 sha256（重签会重排胖文件，偏移不可复用）。 */
+export interface MachoManifest {
+  schema: 1;
+  createdAt: string;
+  appVersion: string;
+  executableRel: string;
+  binarySha256: string;
+  binarySize: number;
+  codeResourcesSha256: string;
+  cpuTypes: number[];
+  patchTargets: string[];
+  discoveredSites: Array<{ target: string; cpuType: number; vmAddr: number; fileOffset: number; originalBytesHex: string }>;
+}
+
+/** 读备份目录里的清单（不存在 / 损坏返回 null）。 */
+export function readManifest(backupDir: string): MachoManifest | null {
+  try {
+    const m = JSON.parse(readFileSync(join(backupDir, "manifest.json"), "utf-8")) as MachoManifest;
+    if (m.schema !== 1 || !m.binarySha256 || !m.codeResourcesSha256) return null;
+    return m;
+  } catch {
+    return null;
+  }
+}
+
+function sha256File(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+/** Info.plist 的展示版本（诊断用）。 */
+function bundleVersion(appDir: string): string {
+  const out = tryExec("plutil", [
+    "-extract", "CFBundleShortVersionString", "raw", "-o", "-",
+    join(appDir, "Contents", "Info.plist"),
+  ]);
+  return (out ?? "").trim() || "unknown";
+}
+
+/** 只读巡检：补丁字节状态 + 签名形态 + 备份在位（--status 用；永不写盘）。 */
+export function inspectMacho(install: TyporaInstall): MachoInspection {
+  const appDir = install.dir;
+  const backupDir = machoBackupDir(appDir);
+  const signature = signatureKind(appDir);
+  const hasBackup = existsSync(backupDir) && readManifest(backupDir) !== null;
+  const base = { signature, backupDir: hasBackup ? backupDir : null };
+
+  let buf: Buffer;
+  try {
+    buf = readFileSync(install.exe);
+  } catch (err) {
+    return { ...base, patched: false, partial: false, detail: `二进制读取失败：${(err as Error).message}` };
+  }
+  let state: ReturnType<typeof readPatchState>;
+  try {
+    state = readPatchState(buf, Object.values(MACHO_TARGETS));
+  } catch (err) {
+    return { ...base, patched: false, partial: false, detail: (err as Error).message };
+  }
+  const patched = state.every((s) => s.patched);
+  const partial = !patched && state.some((s) => s.patched);
+  const detail =
+    state.map((s) => `${s.site.name} @${archName(s.site.cpuType)} 0x${s.site.fileOffset.toString(16)} ${s.patched ? "已补丁" : "未补丁"}`).join("；") +
+    (hasBackup ? "；备份在位" : "；无备份");
+  return { ...base, patched, partial, detail };
+}
+
+/**
+ * 事务化落地：解析定位（缺失即抛、包未动）→ 状态机 → 导出 entitlements（改动前的旧签名是唯一来源）
+ * → 临时目录 stage → 一次性落盘（备份 → 覆盖二进制 → ad-hoc 重签）→ 对重签后的磁盘文件复检
+ * （重签会重排胖文件布局，一切偏移现算）。写盘后任一步失败 ⇒ 从刚写好的备份紧急还原并重抛。
+ */
+export function applyMachOPatch(install: TyporaInstall, opts: { elevate: boolean }): MachoApplyResult {
+  const appDir = install.dir;
+  const backupDir = machoBackupDir(appDir);
+  const codeResources = join(appDir, "Contents", "_CodeSignature", "CodeResources");
+  const exeBasename = basename(install.exe);
+
+  if (!existsSync(codeResources)) {
+    throw new Error(`找不到 ${codeResources}——包结构意外，按显式失败处理（未做任何改动）。`);
+  }
+
+  // 1. 解析定位（符号缺失 ⇒ 抛错退出，包分毫未动）
+  const targets = Object.values(MACHO_TARGETS);
+  const buf = readFileSync(install.exe);
+  const ops = planRetPatches(buf, targets);
+  const allPatched = ops.every((op) => op.current.equals(op.patch));
+
+  const rollbackJobs = (): CopyJob[] => [
+    { from: join(backupDir, exeBasename), to: install.exe },
+    { from: join(backupDir, "CodeResources"), to: codeResources },
+  ];
+
+  // 2. 状态机（哈希是唯一身份；偏移绝不负载语义）
+  const manifest = readManifest(backupDir);
+  if (manifest && ![exeBasename, "CodeResources", "entitlements.xml"].every((f) => existsSync(join(backupDir, f)))) {
+    throw new Error(`备份目录存在但内容不全：${backupDir}（缺 ${exeBasename} / CodeResources / entitlements.xml 之一）。`);
+  }
+  let backupState: "created" | "kept" | "refreshed";
+  if (manifest) {
+    if (allPatched) {
+      if (verifyStrict(appDir)) {
+        // 已补丁且签名完好：零写入，直接报「已打过」
+        return {
+          state: "already",
+          sites: ops.map((op) => ({ name: op.site.name, arch: archName(op.site.cpuType), fileOffset: op.site.fileOffset })),
+          backupDir,
+          rollbackJobs: rollbackJobs(),
+          resigned: false,
+        };
+      }
+      // 已补丁但签名验证失败（被篡改/损坏）：走重签修复；备份不动
+      backupState = "kept";
+    } else {
+      const hashesMatch =
+        sha256File(install.exe) === manifest.binarySha256 &&
+        sha256File(codeResources) === manifest.codeResourcesSha256;
+      backupState = hashesMatch ? "kept" : "refreshed"; // refreshed = Typora 升级/重装过
+    }
+  } else {
+    if (allPatched) {
+      throw new Error(
+        `二进制已打过补丁但备份缺失（${backupDir} 不存在或无清单），无法保证还原。\n` +
+        `  请重装 Typora 后重新执行 pnpm hack。本机未做任何改动。`,
+      );
+    }
+    backupState = "created";
+  }
+
+  // 3. entitlements：必须在任何改动之前导出（旧签名是唯一来源）
+  const rawEnt = dumpEntitlementsXml(appDir);
+  const entXml = withDisableLibraryValidation(rawEnt);
+
+  // 4. 临时目录 stage：一切变换发生在用户可写目录，绝不直接写包
+  const work = mkdtempSync(join(tmpdir(), "hapora-macho-"));
+  const emergencyRestore = (): void => {
+    // 写盘后的任一步失败 ⇒ 从备份字节等价拷回（Developer ID 签名自愈，无需再签）。
+    // 紧急还原自身失败不掩盖原始错误。
+    try {
+      const jobs = rollbackJobs();
+      if (!jobs.every((j) => existsSync(j.from))) return;
+      if (opts.elevate) {
+        elevatedRun(jobs.map((j) => `cp -f ${shellQuote(j.from)} ${shellQuote(j.to)}`), "紧急还原 ");
+      } else {
+        for (const j of jobs) copyFileSync(j.from, j.to);
+      }
+    } catch {
+      /* 见上 */
+    }
+  };
+
+  try {
+    const patchedPath = join(work, "patched.bin");
+    writeFileSync(patchedPath, applyPatches(buf, ops));
+    const entPath = join(work, "entitlements.plist");
+    writeFileSync(entPath, entXml);
+    lintPlistFile(entPath);
+
+    const writingBackup = backupState === "created" || backupState === "refreshed";
+    if (writingBackup) {
+      const m: MachoManifest = {
+        schema: 1,
+        createdAt: new Date().toISOString(),
+        appVersion: bundleVersion(appDir),
+        executableRel: join("Contents", "MacOS", exeBasename),
+        binarySha256: createHash("sha256").update(buf).digest("hex"),
+        binarySize: buf.length,
+        codeResourcesSha256: sha256File(codeResources),
+        cpuTypes: parseSlices(buf).map((s) => s.cpuType),
+        patchTargets: targets,
+        discoveredSites: ops.map((op) => ({
+          target: op.site.name,
+          cpuType: op.site.cpuType,
+          vmAddr: op.site.vmAddr,
+          fileOffset: op.site.fileOffset,
+          originalBytesHex: op.current.toString("hex"),
+        })),
+      };
+      writeFileSync(join(work, "manifest.json"), JSON.stringify(m, null, 2) + "\n");
+      writeFileSync(join(work, "entitlements.orig.xml"), rawEnt);
+    }
+
+    if (opts.elevate) {
+      // root 属主安装：一次 sudo -n 批次做完 备份 → 覆盖 → 重签 → 隔离清理 → 属主归还
+      const st = statSync(install.exe);
+      const lines: string[] = [];
+      if (writingBackup) {
+        lines.push(`mkdir -p ${shellQuote(backupDir)}`);
+        // 备份必须在覆盖可执行文件**之前**落盘（来源是盘上的原始字节）
+        lines.push(`cp -f ${shellQuote(install.exe)} ${shellQuote(join(backupDir, exeBasename))}`);
+        lines.push(`cp -f ${shellQuote(codeResources)} ${shellQuote(join(backupDir, "CodeResources"))}`);
+        lines.push(`cp -f ${shellQuote(join(work, "entitlements.orig.xml"))} ${shellQuote(join(backupDir, "entitlements.xml"))}`);
+        lines.push(`cp -f ${shellQuote(join(work, "manifest.json"))} ${shellQuote(join(backupDir, "manifest.json"))}`);
+      }
+      lines.push(`cp -f ${shellQuote(patchedPath)} ${shellQuote(install.exe)}`);
+      lines.push(`codesign --force --sign - --options runtime --entitlements ${shellQuote(entPath)} ${shellQuote(appDir)}`);
+      lines.push(`xattr -d com.apple.quarantine ${shellQuote(appDir)} 2>/dev/null || true`);
+      // root 跑 codesign/cp 产生的文件归还给原属主（备份目录 + 可执行文件 + 签名目录）
+      lines.push(
+        `chown -R ${st.uid}:${st.gid} ${shellQuote(backupDir)} ${shellQuote(install.exe)} ` +
+        `${shellQuote(join(appDir, "Contents", "_CodeSignature"))} 2>/dev/null || true`,
+      );
+      elevatedRun(lines, `改写 ${appDir} `);
+    } else {
+      if (writingBackup) {
+        mkdirSync(backupDir, { recursive: true });
+        copyFileSync(install.exe, join(backupDir, exeBasename));
+        copyFileSync(codeResources, join(backupDir, "CodeResources"));
+        copyFileSync(join(work, "entitlements.orig.xml"), join(backupDir, "entitlements.xml"));
+        copyFileSync(join(work, "manifest.json"), join(backupDir, "manifest.json"));
+      }
+      copyFileSync(patchedPath, install.exe);
+      resignAdhoc(appDir, entPath);
+      removeQuarantine(appDir);
+    }
+
+    // 5. 复检：对**重签后的磁盘文件**重新解析定位（重签可能重排胖文件，偏移必须现算）
+    const after = readFileSync(install.exe);
+    const afterState = readPatchState(after, targets);
+    if (!afterState.every((s) => s.patched)) {
+      throw new Error("复检失败：重签后的二进制里 ret 补丁字节缺失。");
+    }
+    if (!verifyStrict(appDir)) {
+      throw new Error("复检失败：codesign --verify --strict 未通过。");
+    }
+    return {
+      state: backupState,
+      sites: afterState.map((s) => ({ name: s.site.name, arch: archName(s.site.cpuType), fileOffset: s.site.fileOffset })),
+      backupDir,
+      rollbackJobs: rollbackJobs(),
+      resigned: true,
+    };
+  } catch (err) {
+    emergencyRestore();
+    throw new Error(`Mach-O 补丁落地失败（已尝试从备份还原）：${(err as Error).message}`);
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
 }
