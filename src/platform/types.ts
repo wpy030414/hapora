@@ -3,9 +3,8 @@
  *
  * 补丁本身（Windows/Linux 的 src/inject/patch.js）是平台无关的；真正随平台变的是这几件事：
  *   定位安装目录、进程检测与结束、启动、写入目标与提权、许可证存储、启动验收探针。
- * macOS 版 Typora 是原生应用（无 asar，见 docs/researches/activation-mac.md），
- * 走的是「伪造许可证记录文件」路线：不改动安装目录，被改写的目标（target）是
- * ~/Library 下的许可证记录文件，验收也不读日志而是轮询记录状态。
+ * 三条路线按能力位选择：asar 注入（Windows/Linux）、Mach-O 补丁 + ad-hoc 重签（macOS，ADR-012；
+ * 许可证存储仍是 ~/Library 下的记录文件，由补丁保证它永不过期）。
  */
 
 import { existsSync, unlinkSync, writeFileSync } from "node:fs";
@@ -53,6 +52,34 @@ export type ProbeState =
   /** 尚无法终判，继续轮询 */
   | "pending";
 
+/** Mach-O 补丁路线的只读巡检结果（--status 与幂等判定用；永不写盘）。 */
+export interface MachoInspection {
+  /** 全部补丁目标已在全部切片就位 */
+  patched: boolean;
+  /** 部分就位（异常态：目标集变化后未补齐 / 二进制被部分替换） */
+  partial: boolean;
+  /** 签名形态（每次现跑 codesign，绝不缓存） */
+  signature: "developer-id" | "adhoc" | "unknown";
+  /** 包外二进制备份目录（在位才保证可还原） */
+  backupDir: string | null;
+  /** 逐站点细节（架构 / 偏移 / 状态），供人读 */
+  detail: string;
+}
+
+/** Mach-O 补丁路线的一次落地结果。 */
+export interface MachoApplyResult {
+  /** created=新建备份并补丁；kept=沿用备份补丁；refreshed=升级后刷新备份再补丁；already=已打过零写入 */
+  state: "created" | "kept" | "refreshed" | "already";
+  /** 每个补丁点（目标名 × 架构 × 文件偏移——对重签后的磁盘文件现算，绝不沿用旧值） */
+  sites: Array<{ name: string; arch: string; fileOffset: number }>;
+  /** 包外二进制备份目录 */
+  backupDir: string;
+  /** 还原任务（二进制 + CodeResources 字节等价拷回 ⇒ Developer ID 签名自愈） */
+  rollbackJobs: CopyJob[];
+  /** 是否执行了 ad-hoc 重签 */
+  resigned: boolean;
+}
+
 export interface Platform {
   readonly id: string;
   readonly label: string;
@@ -69,9 +96,24 @@ export interface Platform {
 
   /**
    * 是否走「解包 app.asar 注入补丁再打包」的路线（Windows/Linux）。
-   * macOS 版是原生应用没有 asar，此位为 false：hack 只写许可证存储，不触碰安装目录。
+   * macOS 版是原生应用没有 asar，此位为 false。
    */
   readonly asarPatchSupported: boolean;
+
+  /**
+   * 是否走「Mach-O 二进制补丁 + ad-hoc 重签」路线（macOS，ADR-012）。
+   * 其余平台为 false。
+   */
+  readonly machoPatchSupported: boolean;
+
+  /** Mach-O 补丁的只读巡检（--status / 幂等判定用）；不支持的平台抛错。 */
+  machoInspect(install: TyporaInstall): MachoInspection;
+
+  /**
+   * Mach-O 补丁的事务化落地：备份 → 补丁 → ad-hoc 重签 → 对重签后文件复检。
+   * 符号缺失等一切不可推导情形在写盘之前抛错（宁失败不猜）。
+   */
+  machoApplyPatch(install: TyporaInstall, opts: { elevate: boolean }): MachoApplyResult;
 
   checkWriteAccess(targetPath: string): boolean;
   /** 把文件写进目标位置；不可写时由 elevate=true 走平台提权 */

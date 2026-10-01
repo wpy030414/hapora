@@ -285,6 +285,16 @@ export const windowsPlatform: Platform = {
 
   asarPatchSupported: true,
 
+  machoPatchSupported: false,
+
+  machoInspect(): never {
+    throw new Error("本平台（Windows）不支持 Mach-O 补丁路线。");
+  },
+
+  machoApplyPatch(): never {
+    throw new Error("本平台（Windows）不支持 Mach-O 补丁路线。");
+  },
+
   checkWriteAccess: (targetPath: string) => probeWriteAccess(targetPath),
 
   installFiles(jobs: CopyJob[], opts: { elevate: boolean }): void {

@@ -14,7 +14,8 @@ import { spawn } from "node:child_process";
 
 import {
   isPermissionError, probeWriteAccess, tryExec,
-  type CopyJob, type LicenseInput, type LicenseView, type Platform, type ProbeState, type TyporaInstall,
+  type CopyJob, type LicenseInput, type LicenseView, type MachoApplyResult, type MachoInspection,
+  type Platform, type ProbeState, type TyporaInstall,
 } from "./types.js";
 import { scanRootsForInstall, type ScanSpec } from "./scan.js";
 
@@ -32,31 +33,47 @@ export interface UnixSpec {
   overrideHint: string;
   /** 是否走 asar 注入路线（macOS 原生应用为 false） */
   asarPatchSupported: boolean;
+  /** 是否走 Mach-O 补丁路线（仅 darwin；缺省 false） */
+  machoPatchSupported?: boolean;
+  /** 平台自己的 Mach-O 补丁实现（可选；缺省为「显式失败」） */
+  macho?: Partial<Pick<Platform, "machoInspect" | "machoApplyPatch">>;
   /** 平台自己的许可证实现（可选；缺省为「显式失败」） */
   license?: Partial<Pick<Platform, "licenseSupported" | "licenseUnsupportedReason" | "readLicense" | "writeLicense" | "clearLicense">>;
   /** 平台自己的启动验收探针（可选；缺省为恒 pending——由 CLI 的超时兜底） */
   probeActivation?: Platform["probeActivation"];
 }
 
-/** 用 `sudo -n`（非交互）把一批文件复制进安装目录；需要密码时立即失败而不是挂住。 */
-function elevatedCopyUnix(jobs: CopyJob[], dir: string): void {
-  const work = mkdtempSync(join(tmpdir(), "hapora-elev-"));
-  const script = join(work, "elevated-copy.sh");
-  const quote = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
-  try {
-    const lines = ["#!/bin/sh", "set -e"];
-    for (const job of jobs) lines.push(`cp -f ${quote(job.from)} ${quote(job.to)}`);
-    writeFileSync(script, lines.join("\n") + "\n", { encoding: "utf-8", mode: 0o700 });
+/** shell 单引号包裹（内部单引号转义成 '\''）。 */
+export function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
 
+/**
+ * 用 `sudo -n`（非交互）跑一段 shell 脚本；需要密码时立即失败而不是挂住。
+ * 提权脚本必须一次性做完所有需要 root 的动作（备份 + 成品），绝不把整个 CLI 重跑。
+ */
+export function elevatedRun(lines: string[], desc: string): void {
+  const work = mkdtempSync(join(tmpdir(), "hapora-elev-"));
+  const script = join(work, "elevated.sh");
+  try {
+    writeFileSync(script, ["#!/bin/sh", "set -e", ...lines].join("\n") + "\n", { encoding: "utf-8", mode: 0o700 });
     if (tryExec("sudo", ["-n", "sh", script]) === null) {
       throw new Error(
-        `写入 ${dir} 需要管理员权限，且当前无法免密提权。\n` +
+        `${desc}需要管理员权限，且当前无法免密提权。\n` +
         `  请先执行 \`sudo -v\` 缓存凭据后再运行 pnpm hack，或给该目录写权限。`,
       );
     }
   } finally {
     rmSync(work, { recursive: true, force: true });
   }
+}
+
+/** 用 `sudo -n`（非交互）把一批文件复制进安装目录；需要密码时立即失败而不是挂住。 */
+function elevatedCopyUnix(jobs: CopyJob[], dir: string): void {
+  elevatedRun(
+    jobs.map((job) => `cp -f ${shellQuote(job.from)} ${shellQuote(job.to)}`),
+    `写入 ${dir} `,
+  );
 }
 
 const LICENSE_UNSUPPORTED_LINUX =
@@ -71,6 +88,12 @@ export function createUnixPlatform(spec: UnixSpec): Platform {
   const license = spec.license ?? {};
   const probe: Platform["probeActivation"] =
     spec.probeActivation ?? (() => ({ state: "pending" as ProbeState, detail: "" }));
+  const machoUnsupported = (): never => {
+    throw new Error(`本平台（${spec.label}）不支持 Mach-O 补丁路线。`);
+  };
+  const macho = spec.macho ?? {};
+  const machoInspect: Platform["machoInspect"] = macho.machoInspect ?? machoUnsupported;
+  const machoApplyPatch: Platform["machoApplyPatch"] = macho.machoApplyPatch ?? machoUnsupported;
 
   return {
     id: spec.id,
@@ -127,6 +150,16 @@ export function createUnixPlatform(spec: UnixSpec): Platform {
     isAdmin: () => typeof process.getuid === "function" && process.getuid() === 0,
 
     asarPatchSupported: spec.asarPatchSupported,
+
+    machoPatchSupported: spec.machoPatchSupported ?? false,
+
+    machoInspect(install: TyporaInstall): MachoInspection {
+      return machoInspect(install);
+    },
+
+    machoApplyPatch(install: TyporaInstall, opts: { elevate: boolean }): MachoApplyResult {
+      return machoApplyPatch(install, opts);
+    },
 
     checkWriteAccess: (targetPath: string) => probeWriteAccess(targetPath),
 
