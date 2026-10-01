@@ -2,10 +2,9 @@
  * Unix（macOS / Linux）平台实现的公共部分。
  *
  * 与 Windows 的差别集中在四处：进程检测/结束用 pgrep/pkill、启动直接 exec 可执行文件、
- * 提权用 `sudo -n`（绝不弹交互式密码提示）、许可证存储**尚未实现**。
- *
- * 许可证存储刻意做成「显式抛错」而不是猜一个位置写入：猜错了会产出「打了补丁但没激活」
- * 的半成品，比直接失败更难排查。--restore 在未实现平台上仍是安全的 no-op。
+ * 提权用 `sudo -n`（绝不弹交互式密码提示）、验收/许可证由各平台通过 spec 覆盖
+ * （macOS 已实证实现；Linux 尚无实证结论，维持「显式抛错」而不是猜一个位置写入：
+ * 猜错了会产出「打了补丁但没激活」的半成品，比直接失败更难排查）。
  */
 
 import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -15,7 +14,7 @@ import { spawn } from "node:child_process";
 
 import {
   isPermissionError, probeWriteAccess, tryExec,
-  type CopyJob, type LicenseValues, type LicenseView, type Platform, type TyporaInstall,
+  type CopyJob, type LicenseInput, type LicenseView, type Platform, type ProbeState, type TyporaInstall,
 } from "./types.js";
 import { scanRootsForInstall, type ScanSpec } from "./scan.js";
 
@@ -29,10 +28,14 @@ export interface UnixSpec {
   /** 兜底浅扫描的根目录 */
   scanRoots(): string[];
   scanSpec: ScanSpec;
-  /** 验收日志路径 */
-  logPath(): string;
   /** 显式指定无效时给用户的形态提示 */
   overrideHint: string;
+  /** 是否走 asar 注入路线（macOS 原生应用为 false） */
+  asarPatchSupported: boolean;
+  /** 平台自己的许可证实现（可选；缺省为「显式失败」） */
+  license?: Partial<Pick<Platform, "licenseSupported" | "licenseUnsupportedReason" | "readLicense" | "writeLicense" | "clearLicense">>;
+  /** 平台自己的启动验收探针（可选；缺省为恒 pending——由 CLI 的超时兜底） */
+  probeActivation?: Platform["probeActivation"];
 }
 
 /** 用 `sudo -n`（非交互）把一批文件复制进安装目录；需要密码时立即失败而不是挂住。 */
@@ -56,13 +59,18 @@ function elevatedCopyUnix(jobs: CopyJob[], dir: string): void {
   }
 }
 
-const LICENSE_UNSUPPORTED =
-  "本平台（macOS / Linux）的许可证存储位置尚未确认——Windows 用的是 HKCU\\SOFTWARE\\Typora，\n" +
-  "  而 macOS / Linux 的落点（文件 / plist / keychain）没有经过实证，猜着写会产出「打了补丁却没激活」\n" +
-  "  且难以排查的半成品。因此这里选择显式失败，不改动任何文件。详见 docs/DECISIONS.md ADR-010。";
+const LICENSE_UNSUPPORTED_LINUX =
+  "本平台（Linux）的许可证存储位置尚未确认——Windows 用的是 HKCU\\SOFTWARE\\Typora 的注册表，\n" +
+  "  macOS 用的是 ~/Library 下的加密许可证记录文件（已实证），而 Linux（Electron 版）的落点\n" +
+  "  没有经过实证，猜着写会产出「打了补丁但没激活」且难以排查的半成品。\n" +
+  "  因此这里选择显式失败，不改动任何文件。详见 docs/DECISIONS.md ADR-010 / ADR-011。";
 
 export function createUnixPlatform(spec: UnixSpec): Platform {
   let locateErr = "";
+
+  const license = spec.license ?? {};
+  const probe: Platform["probeActivation"] =
+    spec.probeActivation ?? (() => ({ state: "pending" as ProbeState, detail: "" }));
 
   return {
     id: spec.id,
@@ -118,9 +126,9 @@ export function createUnixPlatform(spec: UnixSpec): Platform {
 
     isAdmin: () => typeof process.getuid === "function" && process.getuid() === 0,
 
-    logPath: () => spec.logPath(),
+    asarPatchSupported: spec.asarPatchSupported,
 
-    checkWriteAccess: (asarPath: string) => probeWriteAccess(asarPath),
+    checkWriteAccess: (targetPath: string) => probeWriteAccess(targetPath),
 
     installFiles(jobs: CopyJob[], opts: { elevate: boolean }): void {
       if (jobs.length === 0) return;
@@ -132,20 +140,20 @@ export function createUnixPlatform(spec: UnixSpec): Platform {
           if (!isPermissionError(err)) throw err;
         }
       }
-      elevatedCopyUnix(jobs, dirname(jobs[0].to));
+      elevatedCopyUnix(jobs, dirname(jobs[0]!.to));
     },
 
-    licenseSupported: false,
-    licenseUnsupportedReason: LICENSE_UNSUPPORTED,
+    licenseSupported: license.licenseSupported ?? false,
+    licenseUnsupportedReason: license.licenseUnsupportedReason ?? LICENSE_UNSUPPORTED_LINUX,
 
-    readLicense: (): LicenseView => ({ license: null, date: null }),
+    readLicense: license.readLicense ?? ((): LicenseView => ({ license: null, date: null })),
 
-    writeLicense(_values: LicenseValues): void {
-      throw new Error(LICENSE_UNSUPPORTED);
-    },
+    writeLicense: license.writeLicense ?? ((): void => { throw new Error(LICENSE_UNSUPPORTED_LINUX); }),
 
-    clearLicense(): void {
+    clearLicense: license.clearLicense ?? ((): void => {
       /* 未实现存储 ⇒ 没有可清的东西；--restore 在此平台依然安全 */
-    },
+    }),
+
+    probeActivation: probe,
   };
 }

@@ -1,14 +1,15 @@
 /**
  * 平台抽象层的公共契约。
  *
- * 补丁本身（src/inject/patch.js 的 publicDecrypt hook、electron.net 拦截、fs/crypto 自校验放行）
- * 是平台无关的；真正随平台变的是这六件事：
- *   定位安装目录、进程检测与结束、启动、验收日志路径、写入安装目录（提权）、许可证存储。
- * 前四件事在本层各平台实现；第五件按平台用 UAC / sudo；第六件目前只有 Windows 有实现。
+ * 补丁本身（Windows/Linux 的 src/inject/patch.js）是平台无关的；真正随平台变的是这几件事：
+ *   定位安装目录、进程检测与结束、启动、写入目标与提权、许可证存储、启动验收探针。
+ * macOS 版 Typora 是原生应用（无 asar，见 docs/researches/activation-mac.md），
+ * 走的是「伪造许可证记录文件」路线：不改动安装目录，被改写的目标（target）是
+ * ~/Library 下的许可证记录文件，验收也不读日志而是轮询记录状态。
  */
 
 import { existsSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 
 export const BACKUP_SUFFIX = ".hapora-orig.bak";
@@ -16,9 +17,9 @@ export const BACKUP_SUFFIX = ".hapora-orig.bak";
 export interface TyporaInstall {
   /** 安装根目录（Windows/Linux 为安装目录；macOS 为 .app 包） */
   dir: string;
-  /** app.asar 所在目录 */
-  resources: string;
-  asar: string;
+  /** 本平台被改写的目标文件：Windows/Linux 为 app.asar；macOS 为许可证记录文件 */
+  target: string;
+  /** target 的原始备份（target + BACKUP_SUFFIX） */
   backup: string;
   /** 启动用的可执行文件 */
   exe: string;
@@ -29,18 +30,28 @@ export interface CopyJob {
   to: string;
 }
 
-/** 写入许可证所需的值；格式由 src/patch.ts 决定，平台只负责落盘 */
-export interface LicenseValues {
-  /** 展示用明文标记 */
-  license: string;
-  /** 展示用日期 */
-  date: string;
+/** 写入许可证所需输入；具体格式由各平台实现决定（Windows：SLicense/IDate；macOS：伪造记录） */
+export interface LicenseInput {
+  email: string;
+  licenseCode: string;
+  now: Date;
 }
 
 export interface LicenseView {
   license: string | null;
   date: string | null;
 }
+
+/** 启动验收探针的结果状态。 */
+export type ProbeState =
+  /** 已确认激活并稳定 */
+  | "activated"
+  /** 激活被撤销（可归因于伪造内容，应当回滚） */
+  | "lost"
+  /** Typora 进程退出 */
+  | "gone"
+  /** 尚无法终判，继续轮询 */
+  | "pending";
 
 export interface Platform {
   readonly id: string;
@@ -56,11 +67,14 @@ export interface Platform {
   /** 当前进程是否已具备管理员/root 权限 */
   isAdmin(): boolean;
 
-  /** 验收要读的日志文件路径 */
-  logPath(): string;
+  /**
+   * 是否走「解包 app.asar 注入补丁再打包」的路线（Windows/Linux）。
+   * macOS 版是原生应用没有 asar，此位为 false：hack 只写许可证存储，不触碰安装目录。
+   */
+  readonly asarPatchSupported: boolean;
 
-  checkWriteAccess(asarPath: string): boolean;
-  /** 把文件写进安装目录；不可写时由 elevate=true 走平台提权 */
+  checkWriteAccess(targetPath: string): boolean;
+  /** 把文件写进目标位置；不可写时由 elevate=true 走平台提权 */
   installFiles(jobs: CopyJob[], opts: { elevate: boolean }): void;
 
   /** 是否支持写入许可证；false 时 hack 必须在改动任何文件之前就退出 */
@@ -69,26 +83,30 @@ export interface Platform {
   readonly licenseUnsupportedReason: string;
   readLicense(): LicenseView;
   /** 写入许可证；平台未实现时抛错 */
-  writeLicense(values: LicenseValues): void;
+  writeLicense(input: LicenseInput): void;
   /** 清空许可证；平台未实现时为 no-op —— --restore 在任何平台都必须可用 */
   clearLicense(): void;
+
+  /**
+   * 启动验收探针：轮询当前激活观测。Windows 读 typora.log 的关键字（hasL 需过自校验
+   * settle 窗口才算数）；macOS 读许可证记录文件是否仍带激活键 + 进程是否存活。
+   */
+  probeActivation(install: TyporaInstall, launchedAtMs: number): { state: ProbeState; detail: string };
 }
 
 /**
- * 把一个候选目录规范成安装信息。
- * 目录里没有 `resources/app.asar`（macOS 为 `Contents/Resources/app.asar`）就返回 null ——
- * 这条判据与后续解包步骤完全一致，因此定位出来的候选不会有误报。
+ * 把一个候选目录规范成安装信息（Windows/Linux 共用：判据是目录下存在
+ * `resources/app.asar`，与后续解包步骤完全一致，因此定位出来的候选不会有误报）。
  */
-export function makeInstall(dir: string, asarRel: string, exeRel: string): TyporaInstall | null {
+export function makeInstall(dir: string, targetRel: string, exeRel: string): TyporaInstall | null {
   const clean = dir.trim().replace(/^"+|"+$/g, "").replace(/[\\/]+$/, "");
   if (!clean) return null;
-  const asar = join(clean, ...asarRel.split("/"));
-  if (!existsSync(asar)) return null;
+  const target = join(clean, ...targetRel.split("/"));
+  if (!existsSync(target)) return null;
   return {
     dir: clean,
-    resources: dirname(asar),
-    asar,
-    backup: asar + BACKUP_SUFFIX,
+    target,
+    backup: target + BACKUP_SUFFIX,
     exe: join(clean, ...exeRel.split("/")),
   };
 }

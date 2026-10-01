@@ -1,7 +1,8 @@
 /**
  * 安装目录的「浅扫描」兜底：在一组根目录下找 Typora 的安装目录。
  *
- * 平台无关，只是每个平台的「目录名 / asar 相对路径 / 常见子目录 / 扫描根」不同。
+ * 平台无关；「像不像 Typora 安装」的判据由各平台通过 probe 提供
+ * （Windows/Linux：目录下存在 resources/app.asar；macOS：.app 包结构）。
  * 两道保险避免在大目录树上卡死：深度上限与目录数上限；外加一份噪声目录跳过表。
  */
 
@@ -11,8 +12,8 @@ import { join } from "node:path";
 export interface ScanSpec {
   /** 会被当作安装目录的目录名（小写比较） */
   names: string[];
-  /** 相对安装目录的 app.asar 路径，用 `/` 分隔 */
-  asarRel: string;
+  /** 「这个目录是 Typora 安装」的判据（快速结构检查即可，最终确认由 locate 的 resolve 做） */
+  probe(dir: string): boolean;
   /** 相对根目录的常见子目录，先按名字碰运气 */
   commonSubdirs: string[];
   /** 目录名跳过表（小写） */
@@ -28,7 +29,6 @@ export const COMMON_SKIP = [
 ];
 
 export function scanRootsForInstall(roots: string[], spec: ScanSpec): string[] {
-  const asarOf = (dir: string) => join(dir, ...spec.asarRel.split("/"));
   const skip = new Set([...COMMON_SKIP, ...spec.skip]);
   const names = new Set(spec.names);
 
@@ -37,7 +37,7 @@ export function scanRootsForInstall(roots: string[], spec: ScanSpec): string[] {
   for (const root of roots) {
     for (const sub of spec.commonSubdirs) {
       const p = join(root, sub);
-      if (existsSync(asarOf(p))) hits.push(p);
+      if (spec.probe(p)) hits.push(p);
     }
   }
   if (hits.length) return hits;
@@ -58,7 +58,7 @@ export function scanRootsForInstall(roots: string[], spec: ScanSpec): string[] {
       const name = entry.name.toLowerCase();
       if (skip.has(name)) continue;
       const child = join(dir, entry.name);
-      if (names.has(name) && existsSync(asarOf(child))) {
+      if (names.has(name) && spec.probe(child)) {
         hits.push(child);
         continue;
       }

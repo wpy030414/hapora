@@ -7,9 +7,11 @@
  */
 
 import { platform } from "./platform/index.js";
-import type { TyporaInstall, CopyJob, LicenseValues, LicenseView } from "./platform/types.js";
+import type {
+  TyporaInstall, CopyJob, LicenseInput, LicenseView, ProbeState,
+} from "./platform/types.js";
 
-export type { TyporaInstall, CopyJob, LicenseValues, LicenseView };
+export type { TyporaInstall, CopyJob, LicenseInput, LicenseView, ProbeState };
 
 /** 当前平台的展示名（用于输出）。 */
 export const platformLabel = (): string => platform().label;
@@ -22,14 +24,18 @@ export const kill = (): void => platform().kill();
 export const launch = (install: TyporaInstall): void => platform().launch(install);
 export const isAdmin = (): boolean => platform().isAdmin();
 
-export const logPath = (): string => platform().logPath();
+/** 是否走「改写 app.asar」的补丁路线；false（macOS）= 只伪造许可证存储 */
+export const asarPatchSupported = (): boolean => platform().asarPatchSupported;
 
-export const checkWriteAccess = (asarPath: string): boolean => platform().checkWriteAccess(asarPath);
+export const checkWriteAccess = (targetPath: string): boolean => platform().checkWriteAccess(targetPath);
 export const installFiles = (jobs: CopyJob[], opts: { elevate: boolean }): void =>
   platform().installFiles(jobs, opts);
 
 export const licenseSupported = (): boolean => platform().licenseSupported;
 export const licenseUnsupportedReason = (): string => platform().licenseUnsupportedReason;
 export const readLicense = (): LicenseView => platform().readLicense();
-export const writeLicense = (values: LicenseValues): void => platform().writeLicense(values);
+export const writeLicense = (input: LicenseInput): void => platform().writeLicense(input);
 export const clearLicense = (): void => platform().clearLicense();
+
+export const probeActivation = (install: TyporaInstall, launchedAtMs: number): { state: ProbeState; detail: string } =>
+  platform().probeActivation(install, launchedAtMs);

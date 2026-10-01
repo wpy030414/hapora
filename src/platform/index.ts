@@ -7,7 +7,7 @@ import { darwinPlatform } from "./darwin.js";
 import { linuxPlatform } from "./linux.js";
 import type { Platform } from "./types.js";
 
-export type { Platform, TyporaInstall, CopyJob, LicenseValues, LicenseView } from "./types.js";
+export type { Platform, TyporaInstall, CopyJob, LicenseInput, LicenseView, ProbeState } from "./types.js";
 
 /** 当前平台实现。不支持的平台直接抛错（调用方在 main 里统一转成非零码退出）。 */
 export function platform(): Platform {

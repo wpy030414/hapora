@@ -64,14 +64,14 @@ interface UidArray {
   readonly __uids__: number[];
 }
 const isUidArray = (v: unknown): v is UidArray =>
-  v !== null && typeof v === "object" && !Array.isArray(v) && "__uids__" in (v as object);
-
-export type PLValue = string | Date | number | boolean | PLValue[] | UidArray | { [key: string]: PLValue };
+  v !== null && typeof v === "object" && !Array.isArray(v) && !(v instanceof PlistUid) && "__uids__" in (v as object);
 
 /** 解码时的 UID（NSKeyedArchive 引用，由 decodeKeyedArchive 解引用）。 */
 export class PlistUid {
   constructor(readonly value: number) {}
 }
+
+export type PLValue = string | Date | number | boolean | PLValue[] | UidArray | PlistUid | { [key: string]: PLValue };
 
 function beInt(n: number, width: number): Buffer {
   const b = Buffer.alloc(width);

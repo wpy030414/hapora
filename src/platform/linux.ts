@@ -8,11 +8,13 @@
  *   - Snap：`/snap/typora/current/typora`
  *   - AppImage：只读的 squashfs 单文件镜像，**本工具不支持**（无从改写其中的 app.asar）
  *
- * 验收日志路径按 Electron 的 userData 惯例推断（`~/.config/Typora/`），**未在真机验证**。
+ * Linux 版是 Electron 应用（asar 路线成立），但许可证存储位置尚未实证，writeLicense
+ * 维持显式失败（见 unix.ts / ADR-010）。
  */
 
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { existsSync } from "node:fs";
 
 import { makeInstall, tryExec, type TyporaInstall } from "./types.js";
 import { createUnixPlatform, type UnixSpec } from "./unix.js";
@@ -29,7 +31,7 @@ function resolveDir(raw: string): TyporaInstall | null {
 
 const SCAN_SPEC: ScanSpec = {
   names: ["typora"],
-  asarRel: ASAR_REL,
+  probe: (dir) => existsSync(join(dir, ...ASAR_REL.split("/"))),
   commonSubdirs: ["typora", "Typora", "share/typora", "opt/typora", "lib/typora"],
   skip: [],
   maxDepth: 2,
@@ -83,9 +85,7 @@ const spec: UnixSpec = {
   },
   scanSpec: SCAN_SPEC,
 
-  logPath() {
-    return join(homedir(), ".config", "Typora", "typora.log");
-  },
+  asarPatchSupported: true,
 
   overrideHint:
     "请指向 Typora 安装根目录（其中含 resources/app.asar）。" +

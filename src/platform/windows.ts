@@ -3,7 +3,8 @@
  *
  * 定位：显式指定 → 注册表 App Paths / 文件关联 → PATH → 默认目录 → 卸载表 → 全盘浅扫描。
  * 写入：目录不可写时用一次 UAC 提权批量复制（备份 + 成品一次完成）。
- * 许可证：HKCU\SOFTWARE\Typora 的 SLicense / IDate —— 本仓库目前唯一有实现的平台。
+ * 许可证：HKCU\SOFTWARE\Typora 的 SLicense / IDate。
+ * 验收：读 %APPDATA%\Typora\typora.log 的关键字（hasL / Integrity check failed / unfill）。
  */
 
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -12,9 +13,10 @@ import { tmpdir } from "node:os";
 import { execFileSync, spawn } from "node:child_process";
 
 import * as reg from "../registry.js";
+import { formatDate, licenseValue } from "../patch.js";
 import {
   isPermissionError, makeInstall, probeWriteAccess, tryExec,
-  type CopyJob, type LicenseValues, type LicenseView, type Platform, type TyporaInstall,
+  type CopyJob, type LicenseInput, type LicenseView, type Platform, type ProbeState, type TyporaInstall,
 } from "./types.js";
 import { scanRootsForInstall, type ScanSpec } from "./scan.js";
 
@@ -141,7 +143,7 @@ const SCAN_SKIP = [
 
 const SCAN_SPEC: ScanSpec = {
   names: ["typora"],
-  asarRel: ASAR_REL,
+  probe: (dir) => existsSync(join(dir, ...ASAR_REL.split("/"))),
   commonSubdirs: COMMON_SUBDIRS,
   skip: SCAN_SKIP,
   maxDepth: 3,
@@ -281,11 +283,9 @@ export const windowsPlatform: Platform = {
     }
   },
 
-  logPath(): string {
-    return join(process.env.APPDATA ?? "", "Typora", "typora.log");
-  },
+  asarPatchSupported: true,
 
-  checkWriteAccess: (asarPath: string) => probeWriteAccess(asarPath),
+  checkWriteAccess: (targetPath: string) => probeWriteAccess(targetPath),
 
   installFiles(jobs: CopyJob[], opts: { elevate: boolean }): void {
     if (jobs.length === 0) return;
@@ -307,12 +307,32 @@ export const windowsPlatform: Platform = {
     return { license: reg.read("SLicense"), date: reg.read("IDate") };
   },
 
-  writeLicense(values: LicenseValues): void {
-    reg.write("SLicense", values.license);
-    reg.write("IDate", values.date);
+  writeLicense(input: LicenseInput): void {
+    reg.write("SLicense", licenseValue(input.now));
+    reg.write("IDate", formatDate(input.now));
   },
 
   clearLicense(): void {
     reg.write("SLicense", "");
+  },
+
+  /** 验收探针：读 typora.log 本次启动片段里的关键字（从 hack.ts 的 verify 下沉而来，行为不变）。 */
+  probeActivation(_install: TyporaInstall, launchedAtMs: number): { state: ProbeState; detail: string } {
+    const START_MARKER = "------------------start------------------";
+    const SETTLE_MS = 6000; // 自校验在启动约 1s 后触发，hasL 必须活过这个窗口才算数
+    const logPath = join(process.env.APPDATA ?? "", "Typora", "typora.log");
+    const text = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+    const i = text.lastIndexOf(START_MARKER);
+    const seg = i >= 0 ? text.slice(i) : "";
+    if (/Integrity check failed/.test(seg)) {
+      return { state: "lost", detail: `自校验没放行（Integrity check failed）。日志：${logPath}` };
+    }
+    if (/unfill due to renew fail/.test(seg)) {
+      return { state: "lost", detail: `续期被判失败（unfill due to renew fail）。日志：${logPath}` };
+    }
+    if (/\[watch L\] hasL: true/.test(seg) && Date.now() - launchedAtMs >= SETTLE_MS) {
+      return { state: "activated", detail: "[watch L] hasL: true（自校验后仍存活）" };
+    }
+    return { state: "pending", detail: "" };
   },
 };
