@@ -71,7 +71,20 @@ export class PlistUid {
   constructor(readonly value: number) {}
 }
 
-export type PLValue = string | Date | number | boolean | PLValue[] | UidArray | PlistUid | { [key: string]: PLValue };
+export type PLValue = string | Date | number | boolean | PLValue[] | UidArray | PlistUid | RealNumber | { [key: string]: PLValue };
+
+/**
+ * 显式要求以 real（0x23 双精度）编码的数字。
+ * 用于 NSKeyedArchive 的 NS.time —— 它语义上是 double，个别时刻恰为整数时
+ * 若退化成 int 会让 NSKeyedUnarchiver 类型不符而整体解档失败。
+ */
+export class RealNumber {
+  constructor(readonly value: number) {}
+}
+
+/** binary plist 的整数 marker：低 4 位是 log2(字节数)（1B=0x10, 2B=0x11, 4B=0x12, 8B=0x13）。 */
+const intMarkerFor = (w: number): number => 0x10 + Math.log2(w);
+const widthForInt = (n: number): number => (n < 0x100 ? 1 : n < 0x10000 ? 2 : n < 0x100000000 ? 4 : 8);
 
 function beInt(n: number, width: number): Buffer {
   const b = Buffer.alloc(width);
@@ -86,7 +99,7 @@ function beInt(n: number, width: number): Buffer {
 function countBytes(n: number): Buffer {
   if (n < 15) return Buffer.from([n]);
   const w = n < 0x100 ? 1 : n < 0x10000 ? 2 : 4;
-  return Buffer.concat([Buffer.from([0xf]), Buffer.from([0x10 + (w - 1)]), beInt(n, w)]);
+  return Buffer.concat([Buffer.from([0xf]), Buffer.from([intMarkerFor(w)]), beInt(n, w)]);
 }
 
 /** 序列化为 binary plist。容器（array/dict）的元素是固定宽度的对象表引用，因此先收集对象再统一序列化。 */
@@ -117,6 +130,7 @@ function encodeBplist(root: PLValue): Buffer {
   };
   const addValue = (v: PLValue): number => {
     if (typeof v === "boolean") return add({ t: "bool", v });
+    if (v instanceof RealNumber) return add({ t: "real", v: v.value });
     if (typeof v === "number") return Number.isInteger(v) ? add({ t: "int", v }) : add({ t: "real", v });
     if (typeof v === "string") return addString(v);
     if (v instanceof Date) return add({ t: "date", v });
@@ -134,7 +148,7 @@ function encodeBplist(root: PLValue): Buffer {
   const markerWithCount = (base: number, n: number): Buffer => {
     if (n < 15) return Buffer.from([base | n]);
     const w = n < 0x100 ? 1 : n < 0x10000 ? 2 : 4;
-    return Buffer.concat([Buffer.from([base | 0xf]), Buffer.from([0x10 + (w - 1)]), beInt(n, w)]);
+    return Buffer.concat([Buffer.from([base | 0xf]), Buffer.from([intMarkerFor(w)]), beInt(n, w)]);
   };
 
   const serialize = (o: Obj): Buffer => {
@@ -143,8 +157,8 @@ function encodeBplist(root: PLValue): Buffer {
         return Buffer.from([o.v ? 0x09 : 0x08]);
       case "int": {
         const v = o.v;
-        const w = v < 0x100 ? 1 : v < 0x10000 ? 2 : v < 0x100000000 ? 4 : 8;
-        return Buffer.concat([Buffer.from([0x10 + (w - 1)]), beInt(v, w)]);
+        const w = widthForInt(v);
+        return Buffer.concat([Buffer.from([intMarkerFor(w)]), beInt(v, w)]);
       }
       case "real": {
         const b = Buffer.alloc(8);
@@ -356,7 +370,7 @@ function encodeKeyedArchive(dict: Map<string, PLValue>): Buffer {
     if (v instanceof Date) {
       const cls = addClass(CLASS_CHAINS.date);
       const entry: { [key: string]: PLValue } = { $class: uidOf(cls) };
-      entry["NS.time"] = (v.getTime() - APPLE_EPOCH_MS) / 1000;
+      entry["NS.time"] = new RealNumber((v.getTime() - APPLE_EPOCH_MS) / 1000); // 必须 double
       return add(entry);
     }
     if (typeof v === "boolean" || typeof v === "number") return add(v);
@@ -442,8 +456,9 @@ export function writeRecord(path: string, uuid: string, record: LicenseRecord): 
 /**
  * 生成伪造记录（研究报告 §4 的配方）：
  *   email / license 键非 nil        ⇒ 启动判定（readLicenseInfo）通过；
- *   license 用 Date 类型污染        ⇒ renew 请求体无法 JSON 序列化，兜底走网络失败宽容分支；
- *   lastTry = now - 2h              ⇒ 落在「1 ≤ hours < 12」的不续期窗口，启动时干脆不发请求。
+ *   lastTry = now - 2h              ⇒ 落在「1 ≤ hours < 12」的不续期窗口，启动时干脆不发请求
+ *                                      （这是防止续期被服务器拒绝后 unfill 的主防线）；
+ *   license 用真实字符串            ⇒ 许可证面板正常显示序列号（它只是展示值，启动不校验内容）。
  * 原有键（installDate / finger 等）原样保留，保证与 Typora 自己的写入互不干扰。
  */
 export function buildForgedRecord(
@@ -453,7 +468,7 @@ export function buildForgedRecord(
   const rec = new Map(existing ?? []);
   const twoHoursAgo = new Date(input.now.getTime() - 2 * 3600 * 1000);
   rec.set("email", input.email);
-  rec.set("license", twoHoursAgo); // 类型污染：值是什么无所谓，键非 nil 即可，类型不是 string 就行
+  rec.set("license", input.licenseCode);
   rec.set("lastTry", twoHoursAgo);
   if (!rec.has("installDate")) rec.set("installDate", input.now);
   rec.delete("failedCounts");

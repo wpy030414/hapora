@@ -55,6 +55,25 @@ CCCrypt 的 key；`x5=0`（IV 为 NULL ⇒ 全零 IV）、`w2=1`（PKCS7）。
 double 秒）；激活后还会出现 `email`、`license`、`lastTry`（NSDate）、`sig` / `oldSig` / `oldFinger`
 （仅在线写入时使用，见 §4）。
 
+### 2.3 生成记录文件的两个编码硬约束（实测踩坑）
+
+自己拼 binary plist 时有两条极易踩的坑，`plistlib` 等宽容解析器**不会**报错，只有客户端用的
+`NSKeyedUnarchiver` 会**静默返回 nil**（表现为「伪造被无视、状态回到未激活」，无任何报错）：
+
+1. **int 的 marker 低 4 位是 log2(字节数)**：1 字节 `0x10`、2 字节 `0x11`、**4 字节 `0x12`、
+   8 字节 `0x13`**。写成「`0x10 + 宽度 - 1`」会把 4 字节整数错标成 8 字节，解析器多读 4 字节，
+   `$version` 与 `NS.time` 等一并损坏。
+2. **`NS.time` 必须编码为 real（`0x23` 双精度）**：它语义上是 double；若某次时间戳恰好是整秒，
+   退化成整数编码同样会让解档失败。
+
+验证手段（以 `NSKeyedUnarchiver` 为准，而非 plistlib）：
+
+```sh
+swift -e 'import Foundation; let d = try! Data(contentsOf: URL(fileURLWithPath: "/tmp/plain.plist"));
+         print(try NSKeyedUnarchiver.unarchiveTopLevelObjectWithData(d) as Any)'
+#   期望输出形如 ["email": …, "license": …, "installDate": …, "lastTry": …]；为 nil 即编码不合格
+```
+
 ## 3. 启动路径：不校验序列号内容，只看键是否存在
 
 `-[LicenseManager start]` → `readLicenseInfo` → `renew`（§4）。`readLicenseInfo` 反汇编还原：
@@ -118,16 +137,22 @@ self._licenseDict[@"lastTry"] = now;           // 只改内存
 ```
 dict = {
   email:       <NSString，来自 .env / 默认值>,
-  license:     <NSDate 类型污染 —— 启动判定只看非 nil，序列化 renew 请求体时必失败，兜底走宽容分支>,
-  lastTry:     <NSDate = now - 2h —— 落在 [1,12) 窗口内，启动时干脆不发请求>,
+  license:     <NSString，展示用序列号 —— 启动判定只看非 nil，不校验内容>,
+  lastTry:     <NSDate = now - 2h —— 落在「1 ≤ hours < 12」窗口，启动时干脆不发请求>,
   installDate: <保留原值>,
   ...其余原有键原样保留（如 finger）...
 }
 ```
 
-双重保险：`lastTry` 让绝大多数启动不发请求；即便发出（升级首启等），类型污染让请求无法携带
-有效载荷，服务器拒绝 ⇒ 走宽容分支。理论残留风险：服务器对空体回 200 + 合法 JSON（从未观察到，
-逻辑上也不成立——空体无法通过其 license 校验）⇒ unfill ⇒ 重跑 `pnpm hack` 即恢复。
+防线的机制边界（实测结论）：
+
+- `lastTry` 窗口是**唯一有效**的防线：窗口内不发 renew，激活保持。
+- 曾尝试的第二道防线「`license` 用非字符串类型污染请求体，使 renew 序列化失败」**已被证伪**：
+  请求体为空时服务器仍可能回 `200`，`sendPost` 判定 `statusCode == 200` 为真而响应体解析为空串，
+  `resp[@"success"]` 为 nil ⇒ 仍走 `unfill`。该污染还会让许可证面板的序列号一栏显示为空，故已弃用。
+- 因此激活有效期 = `lastTry` 窗口长度：**关机的机器在距上次 hack 超过 12 小时后重启会重新续期**，
+  服务器对伪造序列号返回 `success=false` ⇒ `unfill` ⇒ 重跑 `pnpm hack` 即恢复。
+  若 `.env` 配的是**真实有效**的序列号，续期会成功，则不受该窗口限制。
 
 ## 5. 本地校验算法（仅供输码流程，伪造不需要，但记录备查）
 
