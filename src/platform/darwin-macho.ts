@@ -15,7 +15,7 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
@@ -446,6 +446,9 @@ export function applyMachOPatch(install: TyporaInstall, opts: { elevate: boolean
   if (!existsSync(codeResources)) {
     throw new Error(`找不到 ${codeResources}——包结构意外，按显式失败处理（未做任何改动）。`);
   }
+  // 原始执行位：staged 文件是 writeFileSync 建的（0666 & ~umask，无执行位），
+  // copyFileSync 会把源的 mode 带过去——不显式恢复，装出来的二进制不可执行（spawn EACCES）。
+  const origMode = statSync(install.exe).mode & 0o777;
 
   // 1. 解析定位（符号缺失 ⇒ 抛错退出，包分毫未动）
   const targets = Object.values(MACHO_TARGETS);
@@ -560,6 +563,7 @@ export function applyMachOPatch(install: TyporaInstall, opts: { elevate: boolean
         lines.push(`cp -f ${shellQuote(join(work, "manifest.json"))} ${shellQuote(join(backupDir, "manifest.json"))}`);
       }
       lines.push(`cp -f ${shellQuote(patchedPath)} ${shellQuote(install.exe)}`);
+      lines.push(`chmod ${origMode.toString(8)} ${shellQuote(install.exe)}`);
       lines.push(`codesign --force --sign - --options runtime --entitlements ${shellQuote(entPath)} ${shellQuote(appDir)}`);
       lines.push(`xattr -d com.apple.quarantine ${shellQuote(appDir)} 2>/dev/null || true`);
       // root 跑 codesign/cp 产生的文件归还给原属主（备份目录 + 可执行文件 + 签名目录）
@@ -577,6 +581,7 @@ export function applyMachOPatch(install: TyporaInstall, opts: { elevate: boolean
         copyFileSync(join(work, "manifest.json"), join(backupDir, "manifest.json"));
       }
       copyFileSync(patchedPath, install.exe);
+      chmodSync(install.exe, origMode);
       resignAdhoc(appDir, entPath);
       removeQuarantine(appDir);
     }

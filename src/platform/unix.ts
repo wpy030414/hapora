@@ -144,7 +144,9 @@ export function createUnixPlatform(spec: UnixSpec): Platform {
     },
 
     launch(install: TyporaInstall): void {
-      spawn(install.exe, [], { detached: true, stdio: "ignore" }).unref();
+      // detached spawn 的失败是异步 'error' 事件，不接住会崩掉整个 CLI；
+      // 失败场景（如执行位丢失）由验收探针以「进程不存在（gone）」收口并触发回滚。
+      spawn(install.exe, [], { detached: true, stdio: "ignore" }).on("error", () => {});
     },
 
     isAdmin: () => typeof process.getuid === "function" && process.getuid() === 0,

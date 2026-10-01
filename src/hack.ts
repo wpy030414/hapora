@@ -5,12 +5,15 @@
  *   1. 定位 Typora 安装（Windows/Linux 为含 app.asar 的目录；macOS 为 .app 包）
  *   2. [asar 路线，Windows/Linux] 把 src/inject/patch.js 注入明文入口、重新打包、
  *      连同备份一起写进安装目录；写不动时只对这一批复制做一次平台提权（UAC / sudo）
- *   3. [记录路线，macOS] 备份许可证记录文件后直接伪造（不动 /Applications，无需提权）
- *   4. 写入许可证（Windows 为注册表 SLicense / IDate；macOS 为加密记录文件）
+ *   3. [Mach-O 路线，macOS] 在二进制 `-[LicenseManager renew]` 入口写 ret 补丁并 ad-hoc
+ *      重签（包外备份，字节等价可还原）；首次改包可能触发 TCC「App Management」
+ *      一次性授权弹窗，属预期交互
+ *   4. 写入许可证（Windows 为注册表 SLicense / IDate；macOS 为加密记录文件，
+ *      lastTry 金丝雀落在续期窗口之外——记录存活本身即证明补丁生效）
  *   5. 启动 Typora 验收（Windows 读 typora.log 关键字；macOS 轮询记录状态与进程存活）；
  *      验收失败且可归因时自动回滚
  *
- * 不对 Typora 版本、入口文件名、字节码文件名、安装位置做任何硬编码假设。
+ * 不对 Typora 版本、入口文件名、字节码文件名、安装位置、补丁偏移做任何硬编码假设。
  * 平台差异全部收敛在 src/platform/，本文件只做编排（按能力位分支，不按平台名）。
  *
  * 参数：
@@ -22,7 +25,7 @@
  */
 
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { pack, readEntry, readMain, unpack } from "./asar.js";
@@ -47,8 +50,8 @@ const say = (msg = "") => console.log(msg);
 const ok = (msg: string) => console.log(`  ✓ ${msg}`);
 const bad = (msg: string) => console.log(`  ✗ ${msg}`);
 
-/** 改写对象的措辞：Windows/Linux 是 app.asar，macOS 是许可证记录文件 */
-const TARGET_LABEL = tp.asarPatchSupported() ? "app.asar" : "许可证记录文件";
+/** 改写对象的措辞：asar 路线是 app.asar，Mach-O 路线是 Typora 二进制 */
+const TARGET_LABEL = tp.asarPatchSupported() ? "app.asar" : "Typora 二进制";
 
 /**
  * [asar 路线] 判断备份该怎么处理（只看状态，不落盘——真正的写入统一在 installFiles 里做）：
@@ -93,6 +96,16 @@ function printStatus(install: tp.TyporaInstall, config: Config): void {
       say(`  入口文件    读取失败：${(err as Error).message}`);
     }
   }
+  if (tp.machoPatchSupported()) {
+    try {
+      const insp = tp.machoInspect(install);
+      say(`  二进制补丁  ${insp.patched ? "已补丁（renew 短路）" : insp.partial ? "部分补丁（异常，重跑 pnpm hack 补齐）" : "未补丁"}`);
+      say(`  签名        ${insp.signature === "adhoc" ? "ad-hoc（hapora 重签）" : insp.signature === "developer-id" ? "Developer ID（原始）" : "未知"}`);
+      say(`  二进制备份  ${insp.backupDir ?? "（无）"}`);
+    } catch (err) {
+      say(`  二进制补丁  巡检失败：${(err as Error).message}`);
+    }
+  }
   const lic = tp.readLicense();
   if (tp.asarPatchSupported()) {
     say(`  SLicense    ${(lic.license ?? "").slice(0, 60) || "（空）"}`);
@@ -107,19 +120,47 @@ function printStatus(install: tp.TyporaInstall, config: Config): void {
 }
 
 async function doRestore(install: tp.TyporaInstall, elevate: boolean): Promise<void> {
-  if (!existsSync(install.backup)) {
-    say(`找不到备份 ${install.backup}，无法回滚。`);
-    process.exitCode = 1;
-    return;
+  // Mach-O 路线：优先还原二进制 + CodeResources（字节等价拷回 ⇒ Developer ID 签名自愈，无需再签）
+  let machoJobs: tp.CopyJob[] = [];
+  if (tp.machoPatchSupported()) {
+    const insp = tp.machoInspect(install);
+    if (insp.backupDir) {
+      machoJobs = [
+        { from: join(insp.backupDir, basename(install.exe)), to: install.exe },
+        { from: join(insp.backupDir, "CodeResources"), to: join(install.dir, "Contents", "_CodeSignature", "CodeResources") },
+      ];
+    } else if (insp.patched || insp.partial) {
+      bad(`二进制已打补丁但备份缺失，无法还原二进制（可重装 Typora 恢复原始签名）。`);
+      process.exitCode = 1;
+    } else {
+      say("二进制未打补丁，跳过二进制还原。");
+    }
   }
+
+  if (!existsSync(install.backup)) {
+    if (machoJobs.length === 0) {
+      say(`找不到备份 ${install.backup}，无法回滚。`);
+      process.exitCode = 1;
+      return;
+    }
+    say(`许可证记录备份不存在（${install.backup}），仅还原二进制。`);
+  }
+
   if (tp.isRunning()) {
     say("检测到 Typora 正在运行，先关闭它…");
     tp.kill();
     await new Promise((r) => setTimeout(r, 1500));
   }
-  tp.installFiles([{ from: install.backup, to: install.target }], { elevate });
+  // 二进制还原与记录还原分开走：记录文件在 ~ 下必须保持用户属主，不能混进提权批次
+  if (machoJobs.length > 0) tp.installFiles(machoJobs, { elevate });
+  if (existsSync(install.backup)) tp.installFiles([{ from: install.backup, to: install.target }], { elevate: false });
   tp.clearLicense();
-  ok(`已从备份恢复${TARGET_LABEL}，并清空许可证记录`);
+  if (machoJobs.length > 0) {
+    const sig = tp.machoInspect(install).signature;
+    ok(`已还原二进制与签名：${sig === "developer-id" ? "Developer ID（原始）" : sig}；许可证记录已还原`);
+  } else {
+    ok(`已从备份恢复${TARGET_LABEL}，并清空许可证记录`);
+  }
   say("  重新打开 Typora 即回到未激活状态。");
 }
 
@@ -164,7 +205,9 @@ async function doHack(
   }
 
   const asarRoute = tp.asarPatchSupported();
+  const machoRoute = tp.machoPatchSupported();
   let backupState: "created" | "refreshed" | "kept";
+  let machoRollbackJobs: tp.CopyJob[] = [];
 
   if (asarRoute) {
     // ---- asar 路线（Windows/Linux）：备份 → 注入 → 临时目录打包 → 落盘 ----
@@ -201,8 +244,8 @@ async function doHack(
     else if (backupState === "refreshed") ok("检测到 Typora 被重装/升级，已刷新原始备份");
     else ok("已存在原始备份，跳过备份");
     ok(opts.elevate ? "app.asar 已重新打包，并提权写入安装目录" : "app.asar 已重新打包并写入安装目录");
-  } else {
-    // ---- 记录路线（macOS）：不触碰安装目录，只备份许可证记录文件 ----
+  } else if (machoRoute) {
+    // ---- Mach-O 路线（macOS）：二进制补丁 + 重签 → 伪造记录 ----
 
     if (!existsSync(install.target)) {
       bad(`许可证记录文件不存在：${install.target}`);
@@ -210,6 +253,8 @@ async function doHack(
       process.exitCode = 1;
       return;
     }
+
+    // 1. 记录备份独立走用户态（~/Library 永远可写，绝不混入二进制的提权批次——混入会被 chown 成 root）
     backupState = planRecordBackup(install);
     if (backupState === "created") {
       tp.installFiles([{ from: install.target, to: install.backup }], { elevate: false });
@@ -217,6 +262,25 @@ async function doHack(
     } else {
       ok("已存在原始记录备份，跳过备份（它始终指向最早的原始状态）");
     }
+
+    // 2. 二进制补丁（事务化：定位 → 备份 → 覆盖 → ad-hoc 重签 → 复检；失败自动紧急还原）
+    const macho = tp.machoApplyPatch(install, { elevate: opts.elevate });
+    machoRollbackJobs = macho.rollbackJobs;
+    ok(`已定位补丁点：${macho.sites.map((s) => `${s.name}（${s.arch} @0x${s.fileOffset.toString(16)}）`).join("、")}`);
+    if (macho.state === "already") {
+      ok("二进制已打过补丁，跳过写入（签名校验通过）");
+    } else {
+      ok("已写入 ret 补丁，并对重签后的磁盘文件复检一致");
+      if (macho.resigned) ok("已重签名（ad-hoc：原 entitlements 原样保留 + 追加 disable-library-validation）");
+      if (macho.state === "created") ok(`已备份原始二进制与签名 → ${macho.backupDir}`);
+      else if (macho.state === "refreshed") ok("检测到 Typora 被重装/升级，已刷新二进制备份");
+      else ok("已存在二进制备份，跳过备份");
+    }
+  } else {
+    // 其余平台（记录路线遗留位）：能力位模型下当前无平台落在此分支，防御性退出
+    bad("当前平台没有可用的激活路线（既不支持 asar 注入，也不支持 Mach-O 补丁）。");
+    process.exitCode = 1;
+    return;
   }
 
   // 5. 许可证（格式由平台实现决定：Windows 写注册表 SLicense/IDate；macOS 伪造记录文件）
@@ -233,6 +297,8 @@ async function doHack(
     say("完成。重新打开 Typora 即为已激活状态。");
     if (asarRoute) {
       say("跳过验收有风险：若该版本结构与补丁预期不符，Typora 会在启动约 1s 后自行退出。");
+    } else if (machoRoute) {
+      say("跳过验收有风险：若补丁与该版本结构不符，Typora 可能启动失败或激活被撤销。");
     } else {
       say("跳过验收有风险：若该版本结构与预期不符，激活会在启动后被 Typora 自行撤销。");
     }
@@ -252,9 +318,15 @@ async function doHack(
     tp.kill();
     await new Promise((r) => setTimeout(r, 1000));
     try {
-      tp.installFiles([{ from: install.backup, to: install.target }], { elevate: opts.elevate });
+      // 二进制还原与记录还原分开：记录文件必须保持用户属主，不能混进提权批次
+      if (machoRollbackJobs.length > 0) tp.installFiles(machoRollbackJobs, { elevate: opts.elevate });
+      tp.installFiles([{ from: install.backup, to: install.target }], { elevate: false });
       tp.clearLicense();
-      ok("已回滚。你的 Typora 回到未激活状态，功能不受影响");
+      ok(
+        machoRollbackJobs.length > 0
+          ? "已回滚：二进制与签名还原为原始 Developer ID 状态，许可证记录已还原"
+          : "已回滚。你的 Typora 回到未激活状态，功能不受影响",
+      );
     } catch (err) {
       bad(`回滚失败（${(err as Error).message}），请手动执行：  pnpm hack --restore`);
     }
@@ -293,18 +365,24 @@ async function main(): Promise<void> {
   // --status 只读，不写任何东西，也不需要许可证存储可用
   if (has("--status")) return printStatus(install, config);
 
-  // 后面都要改写目标文件（app.asar / 许可证记录）。写不了就提权，但只提权「写文件」那一步：
-  // asar 路线的打包在临时目录里做；macOS 记录路线在 ~ 下本就无需提权。
-  const elevate = !tp.checkWriteAccess(install.target);
+  // 后面都要改写目标文件（app.asar / Typora 二进制）。写不了就提权，但只提权「写文件」那一步：
+  // asar 路线的打包在临时目录里做；Mach-O 路线的补丁与 entitlements 也在临时目录里准备。
+  // Mach-O 路线必须探测二进制所在目录——install.target 是 ~/Library 的记录文件，恒可写，
+  // 探它会误判「无需提权」，然后真正写包时才 EPERM。
+  const elevate = !tp.checkWriteAccess(tp.machoPatchSupported() ? install.exe : install.target);
   if (elevate) {
     if (tp.isAdmin()) {
-      say(`没有写入权限：${install.target}`);
+      say(`没有写入权限：${install.exe}`);
       say("  当前已具备管理员权限但仍无法写入，请检查文件是否被占用或磁盘是否可写。");
       process.exitCode = 1;
       return;
     }
     say(`${label}：Typora 位于需要管理员权限的目录（${install.dir}），改写${TARGET_LABEL}需要提权。`);
-    say("  打包会在临时目录里完成，提权只用来写入文件。");
+    if (tp.machoPatchSupported()) {
+      say("  补丁与 entitlements 在临时目录里准备，提权一次性用于备份 + 写入 + 重签。");
+    } else {
+      say("  打包会在临时目录里完成，提权只用来写入文件。");
+    }
     say();
   }
 

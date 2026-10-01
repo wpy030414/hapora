@@ -89,8 +89,8 @@ const spec: UnixSpec = {
   label: "macOS",
 
   asarPatchSupported: false,
+  machoPatchSupported: true,
 
-  // machoPatchSupported 由 hack 路线切换的提交点亮；实现先行（暗态不可达）
   macho: {
     machoInspect: (install) => inspectMacho(install),
     machoApplyPatch: (install, opts) => applyMachOPatch(install, opts),

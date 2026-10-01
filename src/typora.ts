@@ -8,10 +8,10 @@
 
 import { platform } from "./platform/index.js";
 import type {
-  TyporaInstall, CopyJob, LicenseInput, LicenseView, ProbeState,
+  TyporaInstall, CopyJob, LicenseInput, LicenseView, ProbeState, MachoInspection, MachoApplyResult,
 } from "./platform/types.js";
 
-export type { TyporaInstall, CopyJob, LicenseInput, LicenseView, ProbeState };
+export type { TyporaInstall, CopyJob, LicenseInput, LicenseView, ProbeState, MachoInspection, MachoApplyResult };
 
 /** 当前平台的展示名（用于输出）。 */
 export const platformLabel = (): string => platform().label;
@@ -24,8 +24,18 @@ export const kill = (): void => platform().kill();
 export const launch = (install: TyporaInstall): void => platform().launch(install);
 export const isAdmin = (): boolean => platform().isAdmin();
 
-/** 是否走「改写 app.asar」的补丁路线；false（macOS）= 只伪造许可证存储 */
+/** 是否走「改写 app.asar」的补丁路线（Windows/Linux）。 */
 export const asarPatchSupported = (): boolean => platform().asarPatchSupported;
+
+/** 是否走「Mach-O 二进制补丁 + ad-hoc 重签」路线（macOS，ADR-012）。 */
+export const machoPatchSupported = (): boolean => platform().machoPatchSupported;
+
+/** Mach-O 补丁的只读巡检（--status / 幂等判定用）；不支持的平台抛错。 */
+export const machoInspect = (install: TyporaInstall): MachoInspection => platform().machoInspect(install);
+
+/** Mach-O 补丁的事务化落地（备份 → 补丁 → 重签 → 复检）；不支持的平台抛错。 */
+export const machoApplyPatch = (install: TyporaInstall, opts: { elevate: boolean }): MachoApplyResult =>
+  platform().machoApplyPatch(install, opts);
 
 export const checkWriteAccess = (targetPath: string): boolean => platform().checkWriteAccess(targetPath);
 export const installFiles = (jobs: CopyJob[], opts: { elevate: boolean }): void =>
