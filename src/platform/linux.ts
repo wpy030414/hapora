@@ -8,17 +8,18 @@
  *   - Snap：`/snap/typora/current/typora`
  *   - AppImage：只读的 squashfs 单文件镜像，**本工具不支持**（无从改写其中的 app.asar）
  *
- * Linux 版是 Electron 应用（asar 路线成立），但许可证存储位置尚未实证，writeLicense
- * 维持显式失败（见 unix.ts / ADR-010）。
+ * Linux 版是 Electron 应用（asar 路线），许可证落盘为 ~/.config/Typora/license.json，
+ * 启动验收读 ~/.config/Typora/typora.log（与 Windows 相同的日志关键字）。
  */
 
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
-import { makeInstall, tryExec, type TyporaInstall } from "./types.js";
+import { makeInstall, tryExec, type LicenseInput, type LicenseView, type TyporaInstall } from "./types.js";
 import { createUnixPlatform, type UnixSpec } from "./unix.js";
 import type { ScanSpec } from "./scan.js";
+import { formatDate, licenseValue } from "../patch.js";
 
 const ASAR_REL = "resources/app.asar";
 const EXE_REL = "Typora";
@@ -37,6 +38,37 @@ const SCAN_SPEC: ScanSpec = {
   maxDepth: 2,
   maxDirs: 5000,
 };
+
+const HOME = homedir();
+
+/** 许可证数据目录：Electron userData 在 Linux 上默认 ~/.config/<app> */
+const LICENSE_DIR = join(HOME, ".config", "Typora");
+const LICENSE_FILE = join(LICENSE_DIR, "license.json");
+
+function licenseRead(key: string): string | null {
+  try {
+    const raw = readFileSync(LICENSE_FILE, "utf-8");
+    return (JSON.parse(raw) as Record<string, string>)[key] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function licenseWrite(key: string, value: string): void {
+  mkdirSync(LICENSE_DIR, { recursive: true });
+  let data: Record<string, string> = {};
+  try {
+    const raw = readFileSync(LICENSE_FILE, "utf-8");
+    data = JSON.parse(raw) as Record<string, string>;
+  } catch {
+    /* 文件不存在或格式错误，重置为空 */
+  }
+  data[key] = value;
+  writeFileSync(LICENSE_FILE, JSON.stringify(data, null, 2), "utf-8");
+}
+
+/** 验收 settle 窗口：自校验在启动约 1s 后触发，hasL 必须活过这个窗口才算数 */
+const SETTLE_MS = 6000;
 
 const spec: UnixSpec = {
   id: "linux",
@@ -90,6 +122,44 @@ const spec: UnixSpec = {
   overrideHint:
     "请指向 Typora 安装根目录（其中含 resources/app.asar）。" +
     "注意 AppImage 是只读镜像，本工具不支持。",
+
+  license: {
+    licenseSupported: true,
+    licenseUnsupportedReason: "",
+
+    readLicense(): LicenseView {
+      const sl = licenseRead("SLicense");
+      const id = licenseRead("IDate");
+      return { license: sl, date: id };
+    },
+
+    writeLicense(input: LicenseInput): void {
+      licenseWrite("SLicense", licenseValue(input.now));
+      licenseWrite("IDate", formatDate(input.now));
+    },
+
+    clearLicense(): void {
+      licenseWrite("SLicense", "");
+    },
+  },
+
+  probeActivation(_install, launchedAtMs) {
+    const START_MARKER = "------------------start------------------";
+    const logPath = join(HOME, ".config", "Typora", "typora.log");
+    const text = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+    const i = text.lastIndexOf(START_MARKER);
+    const seg = i >= 0 ? text.slice(i) : "";
+    if (/Integrity check failed/.test(seg)) {
+      return { state: "lost", detail: `自校验没放行（Integrity check failed）。日志：${logPath}` };
+    }
+    if (/unfill due to renew fail/.test(seg)) {
+      return { state: "lost", detail: `续期被判失败（unfill due to renew fail）。日志：${logPath}` };
+    }
+    if (/\[watch L\] hasL: true/.test(seg) && Date.now() - launchedAtMs >= SETTLE_MS) {
+      return { state: "activated", detail: "[watch L] hasL: true（自校验后仍存活）" };
+    }
+    return { state: "pending", detail: "" };
+  },
 };
 
 export const linuxPlatform = createUnixPlatform(spec);

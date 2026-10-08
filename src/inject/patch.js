@@ -44,6 +44,15 @@
       var m = out.match(/MachineGuid\s+REG_SZ\s+(\S+)/);
       if (m) return m[1];
     } catch (e) { /* 读取失败 */ }
+    /* Linux：/etc/machine-id（systemd 标准，Ubuntu / Fedora / Arch 均适用） */
+    try {
+      var id = require("fs").readFileSync("/etc/machine-id", "utf8").trim();
+      if (id && id.length >= 32) return id;
+    } catch (e) { /* 回退到 dbus */ }
+    try {
+      var id = require("fs").readFileSync("/var/lib/dbus/machine-id", "utf8").trim();
+      if (id && id.length >= 32) return id;
+    } catch (e) { /* 读取失败 */ }
     return "";
   }
   /* 指纹必须是客户端自己算出来的那一份：sha256(MachineGuid + "typora") 的 base64 前 10 位，

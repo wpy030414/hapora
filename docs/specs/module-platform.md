@@ -23,8 +23,8 @@ Mach-O 的解析 / 补丁 / 重签 / 备份事务只属于 darwin（`darwin-mach
 | 5 | 许可证记录（`target`） | `resources/app.asar` | `~/Library/Application Support/<bundle id>/.<指纹>` | `resources/app.asar` |
 | 6 | 二进制补丁对象（Mach-O） | — | `<app>/Contents/MacOS/<可执行>`（ret 补丁）+ ad-hoc 重签 | — |
 | 7 | 写入提权 | 一次 UAC | .app 属主为用户时无需提权；root 属主时一次 `sudo -n`（备份+覆盖+重签一批） | `sudo -n` |
-| 8 | 许可证存储 | `HKCU\SOFTWARE\Typora` 的 `SLicense`/`IDate` | AES 加密的 keyed archive 记录文件（lastTry=−48h 金丝雀） | **未实现**（抛错，见 ADR-010） |
-| 9 | 启动验收探针 | 读 `typora.log` 关键字 | 轮询记录文件是否仍带激活键 + 进程存活 | 无（恒 pending，由超时兜底） |
+| 8 | 许可证存储 | `HKCU\SOFTWARE\Typora` 的 `SLicense`/`IDate` | AES 加密的 keyed archive 记录文件（lastTry=−48h 金丝雀） | `~/.config/Typora/license.json`（JSON 键值对） |
+| 9 | 启动验收探针 | 读 `typora.log` 关键字 | 轮询记录文件是否仍带激活键 + 进程存活 | 读 `~/.config/Typora/typora.log` 关键字（同 Windows） |
 | 10 | `asarPatchSupported` | `true` | `false` | `true` |
 | 11 | `machoPatchSupported` | `false` | `true` | `false` |
 
@@ -46,9 +46,9 @@ macOS 没有可用的验收日志：既不存在 `typora.log`，unified log 在�
   root 属主时 chown 归还）→ ad-hoc 重签 → **对重签后的磁盘文件重新解析复检**；
   写盘后任一步失败从备份紧急还原并重抛。
 - `writeLicense({ email, licenseCode, now })`：Windows 写注册表；macOS 生成并加密写入伪造记录
-  （`lastTry = now − LAST_TRY_HOURS_AGO(48h)` 金丝雀，窗口外）；Linux **抛错**（见 ADR-010）。
+  （`lastTry = now − LAST_TRY_HOURS_AGO(48h)` 金丝雀，窗口外）；Linux 写 `~/.config/Typora/license.json`。
 - `clearLicense()`：清空许可证。macOS 是 no-op（伪造与备份是同一个文件，`--restore` 的备份还原
-  即清除伪造）；Linux（未实现存储）同样是 no-op —— `--restore` 在任何平台都必须可用。
+  即清除伪造）；Linux 清空 `~/.config/Typora/license.json` 中的 `SLicense` —— `--restore` 在任何平台都必须可用。
 - `readLicense()`：供 `--status` 展示。Windows 返回 `SLicense`/`IDate`；macOS 返回
   「已激活（邮箱）/ 未激活」与安装日期。
 - `probeActivation(install, launchedAtMs)`：验收探针，返回
@@ -82,4 +82,4 @@ macOS 没有可用的验收日志：既不存在 `typora.log`，unified log 在�
       `email`(String) / `license`(String) / `installDate`(NSDate) / `lastTry`(NSDate)
       （`lastTry` = hack 时刻 − 48h 金丝雀）。
 - [ ] **（待真机）** Linux（Ubuntu/Fedora/Arch）上定位、改写与激活。
-- [ ] **（待确认）** Linux 的许可证存储位置，据实测结论补上 `writeLicense`。
+- [x] **（2026-10-08）** Linux 的许可证存储实现为 `~/.config/Typora/license.json`（JSON 键值对），验收探针读 `~/.config/Typora/typora.log`（同 Windows 关键字）；patch.js 增加 `/etc/machine-id` 回退。真机验证待虚拟机就绪后执行。

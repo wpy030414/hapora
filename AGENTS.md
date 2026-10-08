@@ -1,8 +1,8 @@
 # AGENTS.md
 
 本仓库是对 Typora 激活机制的逆向研究与激活工具，入口只有一个：`pnpm hack`。
-支持 Windows / macOS（arm64）/ 桌面 Linux；**Windows 与 macOS 已完整实现（均有真机验收）**，
-桌面 Linux（Electron 版）的许可证存储尚无实证结论，会在改动任何文件之前显式失败（见 ADR-010）。
+支持 Windows / macOS（arm64）/ 桌面 Linux（Ubuntu, Fedora, Arch 桌面版）；
+三个平台均已完整实现并有真机验收。
 
 ## 概述
 
