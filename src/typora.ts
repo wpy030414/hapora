@@ -43,6 +43,7 @@ export const installFiles = (jobs: CopyJob[], opts: { elevate: boolean }): void 
 
 export const licenseSupported = (): boolean => platform().licenseSupported;
 export const licenseUnsupportedReason = (): string => platform().licenseUnsupportedReason;
+export const licenseStorageLabel = (): string => platform().licenseStorageLabel();
 export const readLicense = (): LicenseView => platform().readLicense();
 export const writeLicense = (input: LicenseInput): void => platform().writeLicense(input);
 export const clearLicense = (): void => platform().clearLicense();

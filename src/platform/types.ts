@@ -123,6 +123,8 @@ export interface Platform {
   readonly licenseSupported: boolean;
   /** 不支持写入许可证时给用户看的原因 */
   readonly licenseUnsupportedReason: string;
+  /** 许可证存储的人读描述（stdout 展示用，避免在 hack.ts 里按平台名分支文案）；可含定位后才知的路径，故为方法 */
+  licenseStorageLabel(): string;
   readLicense(): LicenseView;
   /** 写入许可证；平台未实现时抛错 */
   writeLicense(input: LicenseInput): void;

@@ -123,6 +123,7 @@ const spec: UnixSpec = {
   license: {
     licenseSupported: true,
     licenseUnsupportedReason: "",
+    licenseStorageLabel: () => `伪造记录文件 → ${recordPathCache ?? "(未定位)"}`,
 
     readLicense() {
       const path = recordPathCache;

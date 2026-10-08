@@ -77,7 +77,7 @@ Typora 原生进程（补丁后）
 | `src/platform/darwin.ts` | macOS 实现：Spotlight(`mdfind`) + `/Applications`、`~/Applications`；`.app` 包解析（bundle id 与可执行名读自 Info.plist）；`pgrep`/`pkill`；**走 Mach-O 路线**：二进制补丁 + 记录伪造，验收走记录轮询。 |
 | `src/platform/darwin-license.ts` | macOS 许可证记录文件的编解码与伪造：binary plist 最小编解码器、keyed archive 组装、AES 加解密、指纹/密钥派生、伪造配方（lastTry 金丝雀）。 |
 | `src/platform/darwin-macho.ts` | macOS Mach-O 补丁：fat/符号表解析与补丁点定位（零硬编码偏移）、ret 补丁生成、entitlements 导出注入、codesign 重签封装、包外备份与事务化落地（状态机 + 失败紧急还原）。 |
-| `src/platform/linux.ts` | Linux 实现：`which typora` + `/usr/share/typora` 等 + Flatpak/Snap；`pgrep`/`pkill`；`sudo -n` 提权；许可证 JSON 文件（`~/.config/Typora/license.json`）；验收探针读 `~/.config/Typora/typora.log`。 |
+| `src/platform/linux.ts` | Linux 实现：`which typora` + `/usr/share/typora` 等 + Flatpak/Snap；`pgrep`/`pkill`；`sudo -n` 提权；许可证写 `~/.config/Typora/<指纹>`（hex 编码 JSON，仅 `SLicense` 键）；验收探针读 `~/.config/Typora/typora.log`。 |
 | `src/asar.ts` | `app.asar` 的解包 / 打包 / 读单文件，以及从包内 `package.json` 读 `main`。 |
 | `src/patch.ts` | 补丁模板的加载与占位符渲染；把补丁注入到入口文件最前面；定义许可证值格式。 |
 | `src/inject/patch.js` | 真正写进 Typora 的代码：自校验放行（读取层 + 哈希层）、许可证接管、续期/更新接管。ES5 语法。 |
@@ -116,7 +116,7 @@ Typora 原生进程（补丁后）
      （包外备份 → 覆盖 → 恢复执行位 → ad-hoc 重签）→ 对重签后的磁盘文件重新解析复检；
      随后往 `~/Library/Application Support/<bundle id>/.<指纹>` 写 AES 加密的 keyed archive 字典
      （`email` + `license` + `lastTry=now−48h` 金丝雀 + 保留 `installDate`），不需要提权；
-   - Linux：写入 `~/.config/Typora/license.json`（JSON 键值对，`SLicense`/`IDate`），无需提权。
+   - Linux：写入 `~/.config/Typora/<指纹>`（整段 JSON 的 hex 编码，仅 `SLicense` 键，日期并入其尾段），无需提权。
 8. **验收**（启动 Typora 后轮询平台探针 `probeActivation`）：
    - Windows：只读最后一次启动的 `typora.log` 片段，等过启动 ~1s 的自校验窗口；
      命中 `hasL: true` 且无致命信号判成功；命中 `Integrity check failed` / `unfill due to renew fail`
@@ -133,7 +133,7 @@ Typora 原生进程（补丁后）
 | Typora 安装目录（asar 路线） | 直接改文件 | 仅 Windows/Linux：`app.asar` 被整体替换，原始文件留在同目录的 `.hapora-orig.bak`；目录不可写时这一步需要一次平台提权 |
 | Typora .app 包（Mach-O 路线） | 直接改文件 + `codesign` | 仅 macOS：`Contents/MacOS/<可执行>` 被 ret 补丁后覆盖、包被 ad-hoc 重签；原始二进制 + `CodeResources` + entitlements 备份到**包外** `<.app>.hapora-orig.bak/`；`--restore` 逐字节拷回即恢复 Developer ID 原始签名（自愈，无需再签）。首次改包会触发一次 TCC「App Management」弹窗 |
 | 许可证记录文件（Mach-O 路线） | 直接改文件 | 仅 macOS：`~/Library/Application Support/<bundle id>/.<指纹>` 被替换为伪造记录，原始文件备份为同名的 `.hapora-orig.bak`；用户目录恒可写，**永远走用户态**（不混入二进制的提权批次） |
-| 许可证存储 | Windows：`reg.exe`；macOS：`codesign`/`plutil`/`ioreg` 等外部命令；Linux：Node fs（JSON） | Windows 写 `HKCU\SOFTWARE\Typora` 的 `SLicense`/`IDate`；macOS 的记录加解密由 Node 内置 `crypto` 完成，Mach-O 路线用 `codesign` 重签/验签、`plutil` lint；Linux 写 `~/.config/Typora/license.json` |
+| 许可证存储 | Windows：`reg.exe`；macOS：`codesign`/`plutil`/`ioreg` 等外部命令；Linux：Node fs（hex 编码 JSON） | Windows 写 `HKCU\SOFTWARE\Typora` 的 `SLicense`/`IDate`；macOS 的记录加解密由 Node 内置 `crypto` 完成，Mach-O 路线用 `codesign` 重签/验签、`plutil` lint；Linux 写 `~/.config/Typora/<指纹>`（hex 编码，仅 `SLicense`） |
 | Typora 自身日志 | Windows/Linux 只读 | asar 路线的验收读 `typora.log`（Windows: `%APPDATA%\Typora\`；Linux: `~/.config/Typora/`）；macOS 无日志可用，改读记录文件状态 |
 | 网络 | **不交互** | asar 路线在进程内截断请求；Mach-O 路线让 `renew` 根本不运行——本工具自身不发起任何网络请求 |
 
@@ -167,8 +167,9 @@ Typora 原生进程（补丁后）
   （Windows/Linux：目录下有 `resources/app.asar`；macOS：`.app` 包结构）。详见 ADR-009。
 - **未实现的平台必须显式失败**：许可证存储没有实证结论的平台在改动任何文件
     **之前**就退出，而不是猜一个位置写进去 —— 「打了补丁却没激活」比直接失败更难排查。详见 ADR-010。
-    Linux 的许可证存储已基于 Electron userData 惯例实现（`~/.config/Typora/license.json`），
-    并由 `probeActivation` 验收校验；若真机发现不符，实现将按实证调整。
+    Linux 的许可证存储已在 Ubuntu 26.04 / Typora 1.14.9 真机实证：`~/.config/Typora/<指纹>`
+    （整段 JSON 的 hex 编码），并由 `probeActivation` 读 `typora.log` 验收。详见 ADR-013 与
+    `docs/researches/activation-linux.md`。
 - **macOS 改包但全程可逆**（ADR-012）：Mach-O 路线改写 .app 内的二进制并 ad-hoc 重签
   （entitlements 原样保留 + 追加 `disable-library-validation`）；原始二进制 + `CodeResources`
   备份在包外，`--restore` 逐字节拷回即恢复 Developer ID 原始签名（自愈，无需再签）。

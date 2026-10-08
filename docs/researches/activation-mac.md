@@ -2,7 +2,7 @@
 
 - 样本：Typora `1.14.5-dev`（build 7776，官网渠道，`/Applications/Typora.app`），macOS arm64 真机。
 - 方法：静态反汇编（`otool -tV -arch arm64`）+ Mach-O 常量提取（自写脚本解析 `__DATA` 的 CFString 结构）+ 对本机真实许可证记录文件做 AES 解密实证。全部结论均有可复现判据（见 §8）。
-- 姊妹篇：Windows 版机制见 `activation-mechanism.md`（Electron 1.14.10 实证）。**两平台架构完全不同**，Windows 的结论不可迁移到 macOS。
+- 姊妹篇：Windows 版机制见 `activation-win.md`（Electron 1.14.10 实证）、Linux 版见 `activation-linux.md`（Electron 1.14.9 实证）。**两平台架构完全不同**，Windows 的结论不可迁移到 macOS。
 
 ## 1. 软件结构：macOS 版不是 Electron
 

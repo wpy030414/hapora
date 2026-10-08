@@ -1,8 +1,8 @@
 # hapora
 
 对 Typora 激活机制做逆向分析，并用**一个命令**让它变成已激活状态。
-支持 Windows / macOS（arm64）/ 桌面 Linux；**Windows 与 macOS 已完整实现**，
-Linux（Electron 版）的许可证存储尚无实证结论，会在改动任何文件之前明确报错（见 ADR-010）。
+支持 Windows / macOS（arm64）/ 桌面 Linux，**三个平台均已完整实现并有真机验收**
+（Linux 已在 Ubuntu 26.04 / Typora 1.14.9 实测通过，见 ADR-013；Fedora / Arch 机制同构，待真机验收）。
 
 ## 这是什么？
 
@@ -11,7 +11,7 @@ Linux（Electron 版）的许可证存储尚无实证结论，会在改动任何
   本仓库不搭建任何本地网关、不改 hosts、不伪造 DNS。
 - **两套平台机制**（Typora 在两端根本不是同一种程序）：
   - **Windows / Linux（Electron 版）**：改包内明文入口 `launch.dist.js`，在进程内接管
-    许可证校验链路与更新检查链路（补丁 + 写注册表）。
+    许可证校验链路与更新检查链路（补丁 + 写许可证存储：Windows 注册表 / Linux 指纹文件）。
   - **macOS（原生版）**：原生 AppKit + WebKit 应用，没有 asar 也没有可注入的入口。
     走 **Mach-O 二进制补丁路线**（ADR-012）：在二进制 `-[LicenseManager renew]`（唯一会把
     激活打回的续期入口）写等长的 `ret` 指令使其永不运行，ad-hoc 重签名（entitlements 原样保留 +
@@ -60,7 +60,7 @@ CODE=POWER0-ED0000-BY0000-XRL000
 
 ## 当前状态
 
-- 阶段：可用（Windows 针对 Typora `1.14.10` / Electron `42.2.0`；macOS 针对原生版 `1.14.5-dev`，arm64 真机实测）。
+- 阶段：可用（Windows 针对 Typora `1.14.10` / Electron `42.2.0`；macOS 针对原生版 `1.14.5-dev`，arm64 真机实测；Linux 针对 `1.14.9` 官方 deb，Ubuntu 26.04 真机实测）。
 - 版本无关性：
   - Windows/Linux：入口文件名从包内 `package.json` 的 `main` 读取，注入位置固定在文件最前面，
     自校验基准在打包时按实际内容现算，**不针对某个 Typora 版本写死任何常量**；
@@ -81,9 +81,11 @@ CODE=POWER0-ED0000-BY0000-XRL000
     ad-hoc 重签后 Sparkle 应用内自动更新大概率失效——这与 Windows 路线「伪造更新检查」
     语义等价：补丁不会被自动更新静默覆盖；需要升级时手动下载。
     首次改包会触发一次 macOS 的「App Management」授权弹窗。
-  - Linux（Electron 版）的许可证存储尚无实证结论，会在改动文件**之前**直接失败，而不是留下半成品。
+  - Linux：Snap 版的 `app.asar` 在只读文件系统上（实测 `Read-only file system`），与 AppImage
+    同属不可改写，均不支持；官方 deb / rpm 与 AUR 安装已支持。Fedora / Arch 与 Flatpak
+    形态机制同构，待真机验收。
   - 不支持 AppImage（只读镜像）。
-  - 伪造的许可证载荷字段名（Windows：`deviceId` / `fingerprint` / `email` / `license` /
+  - 伪造的许可证载荷字段名（Windows/Linux：`deviceId` / `fingerprint` / `email` / `license` /
     `version` / `date` / `type`；macOS：记录字典的 `email` / `license` / `lastTry`）来自实测；
     若上游改字段名或存储格式，验收会失败并回滚。
   - 许可证服务端接口按 `/api/client/*` 前缀匹配、更新检查按 `/releases/*.json` 匹配；

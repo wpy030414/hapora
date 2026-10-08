@@ -49,14 +49,15 @@
   - 可选的 `<repo>/.env`。
 - 输出（按平台能力位 `asarPatchSupported` / `machoPatchSupported` 分流）：
   - **asar 路线（Windows/Linux）**：覆盖后的 `app.asar`；首次执行时产生的
-    `app.asar.hapora-orig.bak`；许可证记录写注册表 `HKCU\SOFTWARE\Typora` 的 `SLicense` / `IDate`；
-    验收时启动 Typora 进程并读取 `%APPDATA%\Typora\typora.log`。
+    `app.asar.hapora-orig.bak`；许可证存储分平台——Windows 写注册表 `HKCU\SOFTWARE\Typora` 的
+    `SLicense` / `IDate`，Linux 写 `~/.config/Typora/<指纹>`（整段 JSON 的 hex 编码，仅 `SLicense`，
+    指纹源 `/etc/machine-id`）；验收时启动 Typora 进程并读取日志（Windows：`%APPDATA%\Typora\typora.log`；
+    Linux：`~/.config/Typora/typora.log`），关键字两平台相同。
   - **Mach-O 路线（macOS）**：ret 补丁后的 `Contents/MacOS/<可执行>`（等长替换、ad-hoc 重签、
     entitlements 原样保留 + 追加 disable-library-validation）；包外
     `<.app>.hapora-orig.bak/`（原始二进制 + CodeResources + entitlements + manifest）；
     覆盖 `~/Library/Application Support/<bundle id>/.<指纹>` 并留同名 `.hapora-orig.bak` 备份
     （`lastTry` = −48h 金丝雀）；验收轮询记录状态与进程存活。
-  - Linux 的许可证存储尚无实证结论，在改动任何文件之前直接失败（见 ADR-010）。
   - stdout 的步骤报告。
 
 ## 约束

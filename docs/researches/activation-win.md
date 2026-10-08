@@ -1,4 +1,4 @@
-# Typora 激活机制研究报告
+# Typora Windows 版激活机制逆向研究
 
 > 样本：Typora `1.14.10`（安装器版本 `42.2.0`），Electron `42.2.0` / Node `24.15.0`，Windows 11
 > 安装路径：`%ProgramFiles%\Typora` 或 `%LOCALAPPDATA%\Programs\Typora`

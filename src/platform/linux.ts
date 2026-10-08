@@ -8,10 +8,15 @@
  *   - Snap：`/snap/typora/current/typora`
  *   - AppImage：只读的 squashfs 单文件镜像，**本工具不支持**（无从改写其中的 app.asar）
  *
- * Linux 版是 Electron 应用（asar 路线），许可证落盘为 ~/.config/Typora/license.json，
+ * Linux 版是 Electron 应用（asar 路线），许可证落盘为 ~/.config/Typora/<指纹>，
+ * 指纹 = Base64(SHA256(machineId + "typora"))[0..10]（[/=+-]→"a"，同 Windows 公式）。
+ * 文件内容是整段 JSON 的**十六进制编码**（同 profile.data）：hex(`{"SLicense":"<值>"}`)，
+ * 其中 SLicense = `base64(marker)#0#M/D/YYYY`（无 IDate 键，日期已并入 SLicense 尾段）。
+ * 读写都必须先解/编 hex，否则 Typora 启动时读不出（现象是恒 no info）。
  * 启动验收读 ~/.config/Typora/typora.log（与 Windows 相同的日志关键字）。
  */
 
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -19,7 +24,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { makeInstall, tryExec, type LicenseInput, type LicenseView, type TyporaInstall } from "./types.js";
 import { createUnixPlatform, type UnixSpec } from "./unix.js";
 import type { ScanSpec } from "./scan.js";
-import { formatDate, licenseValue } from "../patch.js";
+import { licenseValue } from "../patch.js";
 
 const ASAR_REL = "resources/app.asar";
 const EXE_REL = "Typora";
@@ -43,28 +48,62 @@ const HOME = homedir();
 
 /** 许可证数据目录：Electron userData 在 Linux 上默认 ~/.config/<app> */
 const LICENSE_DIR = join(HOME, ".config", "Typora");
-const LICENSE_FILE = join(LICENSE_DIR, "license.json");
 
-function licenseRead(key: string): string | null {
+/** 许可证文件名指纹：Base64(SHA256(machineId + "typora"))[0..10]，[/=+-]→"a"（同 Windows 公式） */
+function linuxFingerprint(): string {
+  let mid = "";
   try {
-    const raw = readFileSync(LICENSE_FILE, "utf-8");
-    return (JSON.parse(raw) as Record<string, string>)[key] ?? null;
+    mid = readFileSync("/etc/machine-id", "utf-8").trim();
   } catch {
-    return null;
+    /* 回退到 dbus */
+  }
+  if (!mid) {
+    try {
+      mid = readFileSync("/var/lib/dbus/machine-id", "utf-8").trim();
+    } catch {
+      /* 读取失败 */
+    }
+  }
+  return createHash("sha256").update(mid + "typora").digest("base64")
+    .substring(0, 10).replace(/[/=+-]/g, "a");
+}
+
+let licensePathCache: string | null = null;
+
+function licensePath(): string {
+  if (!licensePathCache) {
+    licensePathCache = join(LICENSE_DIR, linuxFingerprint());
+  }
+  return licensePathCache;
+}
+
+/**
+ * 读许可证文件。Typora 在 Linux 上把整个 JSON 存成**十六进制编码**（同 profile.data），
+ * 即文件内容是 `Buffer.from(json).toString("hex")`，读取时先解 hex 再 JSON.parse。
+ */
+function licenseRead(): { sl: string | null } {
+  try {
+    const hex = readFileSync(licensePath(), "utf-8").trim();
+    const json = Buffer.from(hex, "hex").toString("utf-8");
+    const data = JSON.parse(json) as Record<string, string>;
+    return { sl: data["SLicense"] ?? null };
+  } catch {
+    return { sl: null };
   }
 }
 
-function licenseWrite(key: string, value: string): void {
+function licenseWriteSLicense(value: string): void {
   mkdirSync(LICENSE_DIR, { recursive: true });
   let data: Record<string, string> = {};
   try {
-    const raw = readFileSync(LICENSE_FILE, "utf-8");
-    data = JSON.parse(raw) as Record<string, string>;
+    const hex = readFileSync(licensePath(), "utf-8").trim();
+    data = JSON.parse(Buffer.from(hex, "hex").toString("utf-8")) as Record<string, string>;
   } catch {
     /* 文件不存在或格式错误，重置为空 */
   }
-  data[key] = value;
-  writeFileSync(LICENSE_FILE, JSON.stringify(data, null, 2), "utf-8");
+  data["SLicense"] = value;
+  // 写回十六进制编码（与 Typora 自己的存储格式一致，否则启动时读不出来）
+  writeFileSync(licensePath(), Buffer.from(JSON.stringify(data), "utf-8").toString("hex"), "utf-8");
 }
 
 /** 验收 settle 窗口：自校验在启动约 1s 后触发，hasL 必须活过这个窗口才算数 */
@@ -126,20 +165,21 @@ const spec: UnixSpec = {
   license: {
     licenseSupported: true,
     licenseUnsupportedReason: "",
+    licenseStorageLabel: () => `指纹文件（hex 编码）→ ${licensePath()}`,
 
     readLicense(): LicenseView {
-      const sl = licenseRead("SLicense");
-      const id = licenseRead("IDate");
-      return { license: sl, date: id };
+      const { sl } = licenseRead();
+      // SLicense 形如 `base64(marker)#0#M/D/YYYY`，日期在第二段之后（无独立 IDate 键）
+      const parts = sl ? sl.split("#") : [];
+      return { license: sl, date: parts.length >= 3 ? parts.slice(2).join("#") : null };
     },
 
     writeLicense(input: LicenseInput): void {
-      licenseWrite("SLicense", licenseValue(input.now));
-      licenseWrite("IDate", formatDate(input.now));
+      licenseWriteSLicense(licenseValue(input.now));
     },
 
     clearLicense(): void {
-      licenseWrite("SLicense", "");
+      licenseWriteSLicense("");
     },
   },
 

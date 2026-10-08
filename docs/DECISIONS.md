@@ -403,39 +403,46 @@
 - 何时重新审视：Typora 发布剥离符号的版本（届时显式失败并需重新逆向定位方法，
   见研究报告 §10.2）；或上游把许可证逻辑重命名/重构导致符号消失。
 
-## ADR-013：Linux 许可证存储 — 基于 Electron userData 惯例的文件方案
+## ADR-013：Linux 许可证存储 — hex 编码的指纹文件（真机实证）
 
 - 日期：2026-10-08
-- 状态：已采纳（真机验收待虚拟机就绪后执行）
+- 状态：已采纳（Ubuntu 26.04.1 / Typora 1.14.9 真机验收通过）
 - 背景（遇到了什么问题）：
   ADR-010 将 Linux 标记为「许可证存储未实证，显式失败」。Linux 版 Typora 是 Electron 应用
-  （与 Windows 同一架构，asar 路线成立），asr 补丁管线已完整实现，仅缺少许可证写入与验收探针。
-  需要在 Ubuntu 26 / Fedora 44 桌面版上实现 `pnpm hack` 支持。
+  （与 Windows 同一架构，asar 路线成立），asar 补丁管线已完整实现，仅缺少许可证写入与验收探针。
+  需要在 Ubuntu 26 / Fedora 44 桌面版上实现 `pnpm hack` 支持。本轮在 WSL2 的 Ubuntu 26.04.1
+  上装官方 deb（Typora 1.14.9）完成了实证。
+- 实证结论（完整证据见 `docs/researches/activation-linux.md`）：
+  - **许可证载体**：文件 `~/.config/Typora/<指纹>`（不是注册表、不是 libsecret/keyring）。
+    指纹 = `Base64(SHA256(machineId + "typora"))[0..10]` 清洗 `[/=+-]→"a"`，与 Windows 公式一致，
+    只是 `machineId` 源换成 `/etc/machine-id`（回退 `/var/lib/dbus/machine-id`）。
+  - **文件编码**：整段 JSON 的**十六进制编码**（与同目录 `profile.data` 一致），即磁盘上是
+    `hex('{"SLicense":"..."}')`。读写都必须先解/编 hex —— 这是本轮最耗时的坑：写成裸 JSON 时
+    Typora 读不出 `SLicense`，日志恒 `no info` + `hasL: false` 且**无任何报错**（与 ADR-010 担心的
+    「改了却没激活」半成品现象完全吻合）。
+  - **文件内结构**：只有 `SLicense` 键（无独立 `IDate`），值格式 `base64(密文)#0#M/D/YYYY` 与 Windows 相同。
+  - **激活链路与 Windows 逐字一致**：`pure = undefined` → `crypto.publicDecrypt`（原生）→ `[L] pass` →
+    `hasL: true` → 续期 `license renewed`。`patch.js` 的三个接管点（fs/createHash 自校验放行、
+    publicDecrypt 许可证接管、electron.net 续期接管）**一字未改**即复用。
+  - **日志类名仍是 `[WindowsLicenseLocalStore]`**：Linux 版直接复用了 Windows 的 LocalStore 类，
+    只把「注册表读写」换成「指纹文件 hex 读写」。这**证伪**了 ADR-010「类名带 Windows 前缀 ⇒
+    每平台一套实现」的推断——真正随平台变的只有「存到哪、怎么编码」。
 - 考虑过的方案：
-  1. 在真机上实证后按实际格式实现（理想路径，但需要 VM 环境，开发机暂无 Linux GUI）；
-  2. 基于 Electron userData 惯例推断实现（`~/.config/Typora/license.json`），
-     由验收探针在真机运行时自证正确性；
-  3. 等待用户提供真机截图或日志再做。
-- 决策：采用方案 2。基于以下推断实现，若真机发现不符则按实证调整：
-  - **许可证存储**：`~/.config/Typora/license.json`（JSON 键值对 `SLicense` / `IDate`）。
-    Electron 的 `app.getPath('userData')` 在 Linux 上默认 `~/.config/<appname>`，
-    Typora 作为 Electron 应用大概率使用此路径。存储 `SLicense` / `IDate` 两个键，
-    与 Windows 注册表结构一致（只是载体从注册表变成 JSON 文件）。
-  - **验收探针**：`~/.config/Typora/typora.log`，使用与 Windows 相同的关键字
-    （`[watch L] hasL: true` / `Integrity check failed` / `unfill due to renew fail`）。
-    Linux Electron 版的日志格式与 Windows 应一致（同一代码库）。
-  - **MachineGuid**：`/etc/machine-id`（systemd 标准，32 字符 hex），回退 `/var/lib/dbus/machine-id`。
-    指纹公式 `SHA256(machineId + "typora")` 跨平台一致。
+  1. 基于 Electron userData 惯例推断实现，真机自证（曾短暂采用，推断的 `license.json` + 裸 JSON 均错）；
+  2. 在真机上逐格式 A/B 试写、用 `publicDecrypt`/`fs`/`Module._load` 探针反推（最终采用）；
+  3. 等待用户提供真机日志再做。
+- 决策：采用方案 2 的实证结果落地。`src/platform/linux.ts` 的 `licenseRead`/`licenseWriteSLicense`
+  先解/编 hex 再 JSON；指纹由 `/etc/machine-id` 现算；`readLicense` 从 `SLicense` 尾段切出日期填
+  `IDate` 展示位；`probeActivation` 读 `~/.config/Typora/typora.log`，关键字与 Windows 完全相同。
 - 为什么不选其他：
-  - 方案 1 是最理想的，但 VM 环境搭建需要时间，不应阻塞代码落地；
-  - 方案 3 让用户承担调查工作，体验差。
+  - 方案 1 的两处推断（文件名 `license.json`、裸 JSON 编码）都被真机证伪，印证了 ADR-010
+    「猜一个位置/格式写进去」的风险——只是这次靠探针快速定位，未留下难以排查的半成品；
+  - 方案 3 让用户承担逆向工作，体验差。
 - 后果：
-  - Linux 不再在 `hack.ts` 入口处显式失败，进入完整的 asar 路线（补丁 → 许可证 → 验收）；
-  - `src/inject/patch.js` 增加 `/etc/machine-id` 回退（ES5），不影响 Windows 路径；
-  - `src/platform/linux.ts` 增加 `license` 块与 `probeActivation`，接口遵循 UnixSpec 契约；
-  - 验收探针会在真机上自证：若日志路径或关键字不符，`probeActivation` 恒返回 `pending`
-    并最终超时（45s），不会留下「改了却没激活」的半成品——实现了 ADR-010 要求的
-    「宁可失败也不要静默坏状态」的安全网；
-  - 若实际发现许可证用 libsecret / keyring 等非文件方案，`licenseRead` / `licenseWrite` helper
-    函数是隔离的，换实现即可，不影响外部接口。
-- 何时重新审视：在 Ubuntu 26 / Fedora 44 真机上跑完验收后，根据实证结果调整存储格式或路径。
+  - Linux 不再在 `hack.ts` 入口处显式失败，进入与 Windows 相同的 asar 路线；`hack.ts`/`unix.ts` 零改动；
+  - `src/inject/patch.js` 仅增加 `/etc/machine-id` 回退（ES5），Windows 路径不受影响；
+    `fakeLicense().version` **无需**为 Linux 特化——续期请求里的 `v` 是 Typora 自己按
+    `process.platform` 现算的（实测 `linux|1.14.9`），本地校验也不比对 `version`；
+  - Snap / AppImage 因 `app.asar` 在只读 squashfs 上仍不支持（实测 `touch` 报 `Read-only file system`）。
+- 何时重新审视：Fedora 44（rpm）与 Flatpak 形态待真机验收（机制同构，预期一致）；
+  若某版本改走纯 JS RSA 分支（日志出现 `pure = true`），`publicDecrypt` hook 将落空，需另行接管。

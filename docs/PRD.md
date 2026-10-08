@@ -71,10 +71,12 @@ Typora 两端是**不同的程序，激活链路也不同**：
   - 不写死 Typora 版本相关常量：入口名取自包内 `package.json`（asar 路线），
     bundle id / 可执行名取自 `Info.plist`（macOS），自校验基准打包时现算，
     Mach-O 补丁点运行时解析符号表定位（零硬编码偏移）。
-  - 面向 Typora `1.14.10` / Electron `42.2.0`（Windows）与原生 `1.14.5-dev`（macOS arm64）的实测与文档。
-  - 平台层：Windows、macOS（arm64）、桌面 Linux（Electron 版，见 ADR-010）均已完成，
-    三个平台均有实现并在各自真机验收。桌面 Linux（Ubuntu / Fedora / Arch）走 asar 路线，
-    许可证落盘 `~/.config/Typora/license.json`。
+  - 面向 Typora `1.14.10` / Electron `42.2.0`（Windows）、原生 `1.14.5-dev`（macOS arm64）、
+    `1.14.9`（Linux deb / Ubuntu 26.04）的实测与文档。
+  - 平台层：Windows、macOS（arm64）、桌面 Linux 均走完整实现。Linux（Electron 版，asar 路线）
+    已在 Ubuntu 26.04.1 / Typora 1.14.9 真机验收通过（WSL2），许可证落盘 `~/.config/Typora/<指纹>`
+    （整段 JSON 的 hex 编码，仅 `SLicense` 键，指纹源 `/etc/machine-id`，见 ADR-013）；
+    Fedora / Arch 与 Flatpak 形态机制同构，待真机验收。
 - 范围外：
   - 网关、代理、hosts、DNS 等网络层拦截手段。
   - 修改 V8 字节码 `atom.compiled.dist.jsc`。

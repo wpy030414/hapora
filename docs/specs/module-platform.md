@@ -23,7 +23,7 @@ Mach-O 的解析 / 补丁 / 重签 / 备份事务只属于 darwin（`darwin-mach
 | 5 | 许可证记录（`target`） | `resources/app.asar` | `~/Library/Application Support/<bundle id>/.<指纹>` | `resources/app.asar` |
 | 6 | 二进制补丁对象（Mach-O） | — | `<app>/Contents/MacOS/<可执行>`（ret 补丁）+ ad-hoc 重签 | — |
 | 7 | 写入提权 | 一次 UAC | .app 属主为用户时无需提权；root 属主时一次 `sudo -n`（备份+覆盖+重签一批） | `sudo -n` |
-| 8 | 许可证存储 | `HKCU\SOFTWARE\Typora` 的 `SLicense`/`IDate` | AES 加密的 keyed archive 记录文件（lastTry=−48h 金丝雀） | `~/.config/Typora/license.json`（JSON 键值对） |
+| 8 | 许可证存储 | `HKCU\SOFTWARE\Typora` 的 `SLicense`/`IDate` | AES 加密的 keyed archive 记录文件（lastTry=−48h 金丝雀） | `~/.config/Typora/<指纹>`（hex 编码 JSON，仅 `SLicense`，指纹源 `/etc/machine-id`） |
 | 9 | 启动验收探针 | 读 `typora.log` 关键字 | 轮询记录文件是否仍带激活键 + 进程存活 | 读 `~/.config/Typora/typora.log` 关键字（同 Windows） |
 | 10 | `asarPatchSupported` | `true` | `false` | `true` |
 | 11 | `machoPatchSupported` | `false` | `true` | `false` |
@@ -46,13 +46,14 @@ macOS 没有可用的验收日志：既不存在 `typora.log`，unified log 在�
   root 属主时 chown 归还）→ ad-hoc 重签 → **对重签后的磁盘文件重新解析复检**；
   写盘后任一步失败从备份紧急还原并重抛。
 - `writeLicense({ email, licenseCode, now })`：Windows 写注册表；macOS 生成并加密写入伪造记录
-  （`lastTry = now − LAST_TRY_HOURS_AGO(48h)` 金丝雀，窗口外）；Linux 写 `~/.config/Typora/license.json`。
+  （`lastTry = now − LAST_TRY_HOURS_AGO(48h)` 金丝雀，窗口外）；Linux 写 `~/.config/Typora/<指纹>`
+  （hex 编码 JSON，`SLicense = base64(marker)#0#M/D/YYYY`）。
 - `clearLicense()`：清空许可证。macOS 是 no-op（伪造与备份是同一个文件，`--restore` 的备份还原
-  即清除伪造）；Linux 清空 `~/.config/Typora/license.json` 中的 `SLicense` —— `--restore` 在任何平台都必须可用。
+  即清除伪造）；Linux 把 `~/.config/Typora/<指纹>` 里的 `SLicense` 清空（仍写回 hex 编码）—— `--restore` 在任何平台都必须可用。
 - `readLicense()`：供 `--status` 展示。Windows 返回 `SLicense`/`IDate`；macOS 返回
-  「已激活（邮箱）/ 未激活」与安装日期。
+  「已激活（邮箱）/ 未激活」与安装日期；Linux 解 hex 取 `SLicense`，并从其尾段切出日期填 `IDate` 展示位。
 - `probeActivation(install, launchedAtMs)`：验收探针，返回
-  `activated | lost | gone | pending`。Windows 读日志关键字（`lost` 携日志路径）；
+  `activated | lost | gone | pending`。Windows/Linux 读日志关键字（`lost` 携日志路径）；
   macOS 解密记录文件判 `email`/`license` 键是否仍在（`lost` 即发生了 unfill），并查进程存活。
 
 ## 约束
@@ -68,7 +69,7 @@ macOS 没有可用的验收日志：既不存在 `typora.log`，unified log 在�
 - [x] `scanRootsForInstall` 对平台结构判据（asar 路径 / `.app` 包）都能扫到：深度上限内命中、超出深度或结构不符的不命中。
 - [x] macOS `locate` 接受 `.app`、`Contents`、`Contents/Resources`、`Contents/MacOS` 四种形态并归一到同一个 `.app`。
 - [x] 各平台 `locate` 无效路径返回 null 并给出形态提示。
-- [x] Linux 的 `writeLicense` 抛错、`clearLicense` 不抛、`readLicense` 返回 null。
+- [x] Linux 的 `writeLicense` 写 hex 编码指纹文件、`clearLicense` 清空 `SLicense`、`readLicense` 解 hex 取 `SLicense` 并从尾段切出日期（见下条真机验收）。
 - [x] **（2026-10-01 真机 · Mach-O 路线）** macOS arm64（Typora 1.14.5-dev）：`machoInspect`
       对原始包报「未补丁 / Developer ID / 无备份」；`applyMachOPatch` 后双架构补丁点首指令为
       `ret`/`retq`（与 `nm`/`otool` 逐一对账，arm64 vm `0x1000731f8`→文件偏移 `0x2071f8`、
@@ -81,5 +82,12 @@ macOS 没有可用的验收日志：既不存在 `typora.log`，unified log 在�
 - [x] **（2026-10-01 真机）** macOS 记录文件生成物以 `NSKeyedUnarchiver` 独立验证可解出
       `email`(String) / `license`(String) / `installDate`(NSDate) / `lastTry`(NSDate)
       （`lastTry` = hack 时刻 − 48h 金丝雀）。
-- [ ] **（待真机）** Linux（Ubuntu/Fedora/Arch）上定位、改写与激活。
-- [x] **（2026-10-08）** Linux 的许可证存储实现为 `~/.config/Typora/license.json`（JSON 键值对），验收探针读 `~/.config/Typora/typora.log`（同 Windows 关键字）；patch.js 增加 `/etc/machine-id` 回退。真机验证待虚拟机就绪后执行。
+- [x] **（2026-10-08 真机 · Ubuntu 26.04.1 / Typora 1.14.9 / WSL2）** Linux 定位、改写与激活：
+      `pnpm hack --yes` 全程 exit 0，日志同段满足 `[L] pass`、`[watch L] hasL: true`、
+      `[renewLicense]: license renewed`，且无 `Integrity check failed`、无 `unfill due to renew fail`；
+      `--status` 显示「已注入补丁」+ `SLicense`/`IDate`（后者从 SLicense 尾段切出）；
+      `--restore` 后 `app.asar` 与备份 `cmp` 字节一致、许可证清空；幂等重跑再次激活成功。
+- [x] **（2026-10-08 真机）** Linux 许可证存储实证为 `~/.config/Typora/<指纹>`（指纹源 `/etc/machine-id`，
+      公式同 Windows），文件内容是整段 JSON 的 **hex 编码**、仅 `SLicense` 键；`patch.js` 增加
+      `/etc/machine-id` 回退。详见 `docs/researches/activation-linux.md`。
+- [ ] **（待真机）** Fedora 44（rpm）与 Flatpak 形态的 Linux 验收（机制同构，预期一致）。

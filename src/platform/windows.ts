@@ -312,6 +312,7 @@ export const windowsPlatform: Platform = {
 
   licenseSupported: true,
   licenseUnsupportedReason: "",
+  licenseStorageLabel: () => "注册表（SLicense / IDate）",
 
   readLicense(): LicenseView {
     return { license: reg.read("SLicense"), date: reg.read("IDate") };

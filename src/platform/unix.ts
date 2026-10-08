@@ -38,7 +38,7 @@ export interface UnixSpec {
   /** 平台自己的 Mach-O 补丁实现（可选；缺省为「显式失败」） */
   macho?: Partial<Pick<Platform, "machoInspect" | "machoApplyPatch">>;
   /** 平台自己的许可证实现（可选；缺省为「显式失败」） */
-  license?: Partial<Pick<Platform, "licenseSupported" | "licenseUnsupportedReason" | "readLicense" | "writeLicense" | "clearLicense">>;
+  license?: Partial<Pick<Platform, "licenseSupported" | "licenseUnsupportedReason" | "licenseStorageLabel" | "readLicense" | "writeLicense" | "clearLicense">>;
   /** 平台自己的启动验收探针（可选；缺省为恒 pending——由 CLI 的超时兜底） */
   probeActivation?: Platform["probeActivation"];
 }
@@ -180,6 +180,8 @@ export function createUnixPlatform(spec: UnixSpec): Platform {
 
     licenseSupported: license.licenseSupported ?? false,
     licenseUnsupportedReason: license.licenseUnsupportedReason ?? LICENSE_UNSUPPORTED_LINUX,
+
+    licenseStorageLabel: license.licenseStorageLabel ?? ((): string => "（本平台许可证存储未实现）"),
 
     readLicense: license.readLicense ?? ((): LicenseView => ({ license: null, date: null })),
 

@@ -8,9 +8,9 @@
  *   3. [Mach-O 路线，macOS] 在二进制 `-[LicenseManager renew]` 入口写 ret 补丁并 ad-hoc
  *      重签（包外备份，字节等价可还原）；首次改包可能触发 TCC「App Management」
  *      一次性授权弹窗，属预期交互
- *   4. 写入许可证（Windows 为注册表 SLicense / IDate；macOS 为加密记录文件，
- *      lastTry 金丝雀落在续期窗口之外——记录存活本身即证明补丁生效）
- *   5. 启动 Typora 验收（Windows 读 typora.log 关键字；macOS 轮询记录状态与进程存活）；
+ *   4. 写入许可证（Windows 为注册表 SLicense / IDate；Linux 为 ~/.config/Typora/<指纹> 的 hex 编码文件；
+ *      macOS 为加密记录文件，lastTry 金丝雀落在续期窗口之外——记录存活本身即证明补丁生效）
+ *   5. 启动 Typora 验收（Windows/Linux 读 typora.log 关键字；macOS 轮询记录状态与进程存活）；
  *      验收失败且可归因时自动回滚
  *
  * 不对 Typora 版本、入口文件名、字节码文件名、安装位置、补丁偏移做任何硬编码假设。
@@ -283,13 +283,13 @@ async function doHack(
     return;
   }
 
-  // 5. 许可证（格式由平台实现决定：Windows 写注册表 SLicense/IDate；macOS 伪造记录文件）
+  // 5. 许可证（格式由平台实现决定：Windows 写注册表 SLicense/IDate；Linux 写指纹文件 hex；macOS 伪造记录文件）
   const now = new Date();
   tp.writeLicense({ email: config.email, licenseCode: config.licenseCode, now });
   if (!LICENSE_SHAPE.test(config.licenseCode)) {
     say(`  ! 序列号 ${config.licenseCode} 不匹配 Typora 的 ([A-Z0-9]{6}-){3}[A-Z0-9]{6} 形状，仅作展示用`);
   }
-  ok(asarRoute ? "许可证已写入注册表（SLicense / IDate）" : `许可证记录已伪造 → ${install.target}`);
+  ok(asarRoute ? `许可证已写入${tp.licenseStorageLabel()}` : `许可证记录已伪造 → ${install.target}`);
 
   // 6. 验收（失败且可归因于本次改动时自动回滚）
   say();
