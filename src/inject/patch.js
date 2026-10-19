@@ -160,17 +160,27 @@
     return h;
   };
 
-  /* ---------- 2. 作废激活校验：劫持 publicDecrypt 的返回值 ----------
-   * 许可证密文经 publicDecrypt 解密后即为许可证 JSON。
-   * 对无法解密的密文直接返回本地构造的许可证载荷，于是任意 SLicense 都能通过本地校验。
+  /* ---------- 2. 作废激活校验：只在「解不开」时接管 publicDecrypt ----------
+   * Typora 用 crypto.publicDecrypt 做两件事：
+   *   (a) 解密许可证密文 —— 明文是许可证 JSON；
+   *   (b) 运行数分钟后的周期性 RSA 自检（Math.random() 命中高值分支时触发，日志打
+   *       `2nd <随机数>`）：用一段内置固定密文解密，期望得到一段固定的**非 JSON**明文，
+   *       再与内置期望值做 Buffer.equals 比较；不符就撤销激活并清空 SLicense。
+   * 我们写进许可证存储的是明文标记（长度/填充都不合法），(a) 的解密必然抛错。
+   * 因此判据只有一条：**解密抛错才返回伪造载荷，解密成功一律原样放行**——
+   * 真实许可证（JSON）与自检密文（固定明文）都透明通过，只有我们自己的标记被替换。
+   * （历史 bug：早期判据是「明文不以 { 开头就伪造」，会把 (b) 的合法自检明文也换成
+   *  许可证 JSON，使 equals 比较失败 —— 表现为「用了几分钟到几小时后 SLicense 被清空、
+   *  激活被撤销」。见 docs/DECISIONS.md ADR-014。）
    */
   var origPublicDecrypt = crypto.publicDecrypt;
   crypto.publicDecrypt = function () {
     try {
-      var out = origPublicDecrypt.apply(this, arguments);
-      if (out.toString("utf8").charAt(0) === "{") return out; /* 真实许可证：原样放行 */
-    } catch (e) { /* 密文非法（长度不对 / 填充不对）→ 落入伪造载荷 */ }
-    return Buffer.from(JSON.stringify(fakeLicense()), "utf8");
+      return origPublicDecrypt.apply(this, arguments);
+    } catch (e) {
+      /* 密文非法（长度不对 / 填充不对）——只可能是我们写入的标记 → 伪造许可证载荷 */
+      return Buffer.from(JSON.stringify(fakeLicense()), "utf8");
+    }
   };
 
   /* ---------- 3. 伪造许可证服务器响应 & 屏蔽更新检查 ---------- */
