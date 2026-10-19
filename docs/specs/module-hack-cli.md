@@ -106,6 +106,10 @@
   macOS：记录被 unfill 清除或进程退出）：判为本次改动不兼容 → 自动回滚（macOS 额外还原
   二进制 + CodeResources，字节等价 ⇒ Developer ID 签名自愈）+ 清许可证。
 - 40s 内既无激活信号也无致命信号：判为无法判定，改动保留并提示手动观察。
+- **验收窗口（6s settle / 40s 超时）覆盖不到运行期延迟检查**：Typora 的周期性 RSA 自检在启动约
+  530s（≈9 分钟）后才触发，`unfill` 若由它引起，`pnpm hack` 早已报成功退出。因此 CLI 验收**不承诺**
+  捕获这类失败；对「补丁是否对合法解密透明」的保证由 `test/`（`pnpm test`）承担，见 ADR-014 与
+  `module-license-patch.md` 的验收标准。
 
 ## 验收标准
 

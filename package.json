@@ -5,7 +5,8 @@
   "description": "Typora 激活机制研究与激活补丁",
   "type": "module",
   "scripts": {
-    "hack": "tsx src/hack.ts"
+    "hack": "tsx src/hack.ts",
+    "test": "tsx --test --test-timeout=15000 test/"
   },
   "dependencies": {
     "@electron/asar": "^3.2.0"

@@ -280,6 +280,13 @@ pnpm hack --restore
 - **纯 JS RSA 分支（`pure = true`）**：本样本走原生 `publicDecrypt`，未触发 `jsDecrypt`；
   若某发行版/版本改走纯 JS 分支，`patch.js` 的 `publicDecrypt` hook 将落空，需另行接管（届时日志会出现
   `pure = true` / `pure js failed`，可据此判断）。
+- **运行期周期性 RSA 自检**：Linux 与 Windows 共用同一份 `patch.js` 与同一套 `.jsc` 业务逻辑，
+  因此 Windows 篇 §6.1 描述的「启动约 9 分钟后、`Math.random() >= 0.8` 时用固定密文自检解密函数」
+  预期同样适用于 Linux；ADR-014 的修复（`publicDecrypt` 只在解密抛错时接管、成功一律透传）对两平台
+  同时生效，无需为 Linux 特化。**但这条预期尚未在 Linux 真机上观测**：ADR-013 那轮验收只跑了启动路径
+  （6s 窗口），本轮 ADR-014 的三轮真机取证全部在 Windows 上完成。待补的 Linux 判据与 Windows 相同——
+  运行超过 530s 后日志出现 `2nd <随机数>`，若随机数 `>= 0.8` 则其后不得跟 `onUnfillLicense`、
+  `~/.config/Typora/<指纹>` 里的 `SLicense` 不得被清空。
 
 ---
 

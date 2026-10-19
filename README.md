@@ -35,6 +35,7 @@ pnpm hack --no-verify   # 只打补丁，不启动验收
 pnpm hack --restore     # 回滚到原始状态
 pnpm hack --status      # 只看状态，不改动
 pnpm hack --dir "D:\Software\Typora"   # 装在非常规位置时显式指定安装目录
+pnpm test               # 补丁的单元/回归测试（vm 沙箱，约 0.2s，无需安装 Typora）
 ```
 
 安装目录的探测顺序：`--dir` / `HAPORA_TYPORA_DIR` → 注册表（Windows）/ Spotlight（macOS）/ `which`（Linux）
@@ -71,6 +72,8 @@ CODE=POWER0-ED0000-BY0000-XRL000
   - **Windows/Linux**：`typora.log` 中出现 `[L] pass` 与 `[watch L] hasL: true`；出现
     `[renewLicense]: license renewed`，且**不出现** `Integrity check failed`、`onUnfillLicense`；
     启动约 1s 的自校验窗口过去后进程仍在；主窗口无 `UNREGISTERED` 水印。
+    另需**活过启动约 9 分钟的周期性 RSA 自检**（日志出现 `2nd <随机数>` 后不得跟 `onUnfillLicense`、
+    `SLicense` 不得被清空）——该判据由 `pnpm test` 的回归测试覆盖，见 ADR-014。
   - **macOS**：双架构 `renew` 入口首指令为 `ret`/`retq`；`codesign --verify --strict` 通过
     （ad-hoc）；启动后许可证记录文件仍完整携带 `email`/`license` 键且进程存活——记录的
     `lastTry` 落在续期窗口**之外**，存活本身就是 `renew` 已被短路的自证；`--restore` 能把
@@ -90,6 +93,9 @@ CODE=POWER0-ED0000-BY0000-XRL000
     若上游改字段名或存储格式，验收会失败并回滚。
   - 许可证服务端接口按 `/api/client/*` 前缀匹配、更新检查按 `/releases/*.json` 匹配；
     路径规则若大改同样会由验收兜住。
+  - **启动验收只覆盖约 6s 窗口**：Typora 还有延迟约 9 分钟、按概率触发的运行期检查
+    （周期性 RSA 自检），`pnpm hack` 的启动验收在原理上测不到。本工具的补丁接管对**所有合法输入
+    透明**（只在解密失败时伪造），因此不受这类检查影响；相关回归由 `pnpm test` 覆盖（见 ADR-014）。
 
 ## 核心技术
 

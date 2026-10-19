@@ -29,9 +29,19 @@ Typora 启动约 1s 后会：读 `<asar>/package.json` 取 `main` → 读该文�
 ### 2. 许可证解密接管
 
 - 包装 `crypto.publicDecrypt`。
-- 先调用原实现：若返回的文本以 `{` 开头（真实许可证 JSON），原样返回。
-- 否则（抛错或返回非 JSON）返回本地构造的许可证 JSON：
-  `deviceId` / `fingerprint` / `email` / `license` / `version` / `date` / `type`。
+- **判据只有一条：解密抛错才返回伪造载荷，解密成功一律原样返回。**
+  Typora 用 `publicDecrypt` 做两件事：
+  1. 解密许可证密文（明文是许可证 JSON）；
+  2. 运行约 9 分钟后的**周期性 RSA 自检**（`Math.random() >= 0.8` 时触发，日志打 `2nd <随机数>`）：
+     用内置固定密文解密，期望得到一段固定的**非 JSON** 明文，再做 `Buffer.equals` 比较。
+  本工具写进许可证存储的是明文标记（18 字节，长度非法），(1) 必然抛 `DATA_LEN_NOT_EQUAL_TO_MOD_LEN`；
+  (2) 的固定密文合法、解密必然成功。因此「成功即放行」对两类调用都正确：
+  真实许可证与自检明文都透明通过，只有我们自己的标记被替换成伪造载荷。
+- 伪造载荷字段：`deviceId` / `fingerprint` / `email` / `license` / `version` / `date` / `type`。
+- **反例（ADR-014 修复的 bug）**：曾用「明文不以 `{` 开头就返回伪造载荷」作判据。它会把自检的合法
+  非 JSON 明文换成许可证 JSON，使 `equals` 比较失败 ⇒ 撤销激活并清空 `SLicense`。
+  现象是「激活后能用几分钟到几小时，然后 `SLicense` 被清空」，且启动验收完全测不出来
+  （自检在启动约 9 分钟后才跑，`pnpm hack --yes` 只等 6s）。
 - `fingerprint` **必须逐字符等于客户端自己算出来的那一份**，否则整份载荷被拒（详见研究报告 §4.1）：
   `Base64(SHA256(MachineGuid + "typora"))[0..10].replace(/[/=+-]/g, "a")`，
   `MachineGuid` 来自 `HKLM\SOFTWARE\Microsoft\Cryptography`（先试 `native-reg`，失败回退 `reg.exe`）。
@@ -77,7 +87,12 @@ Typora 启动约 1s 后会：读 `<asar>/package.json` 取 `main` → 读该文�
 
 ## 边界条件
 
-- `crypto.publicDecrypt` 收到空 Buffer / 非法 Base64 / 长度不符的密文 → 落回伪造载荷。
+- `crypto.publicDecrypt` 收到空 Buffer / 非法 Base64 / 长度不符的密文（抛错）→ 落回伪造载荷。
+- `crypto.publicDecrypt` **解密成功但明文不是 JSON**（周期性自检的固定密文）→ 必须原样返回，
+  不得替换成伪造载荷。这是 ADR-014 修复的核心：替换会让 Typora 的 `Buffer.equals` 自检失败，
+  进而在启动约 9 分钟后撤销激活并清空 `SLicense`。
+- `Math.random()` 是自检分支的选择器：`>= 0.8` 走自检、`< 0.8` 走重新校验许可证。
+  补丁对两条分支都必须正确（不得依赖随机数落在哪一侧）。
 - `MachineGuid` 读不到 → 指纹退化为 `SHA256("typora")` 的前 10 位；**客户端会因指纹对不上而拒绝**，
   表现为 `no info` / `onUnfillLicense` / `hasL: false`（不会报错，也不会崩）。这是已知的失败模式，
   不是可以忽略的降级。
@@ -99,6 +114,24 @@ Typora 启动约 1s 后会：读 `<asar>/package.json` 取 `main` → 读该文�
 - [x] 启动后 `checkForUpdates` 不再产生任何更新提示。
 - [x] 主窗口无 `UNREGISTERED` 水印，许可证对话框显示「已使用以下序列号激活」。
 - [x] 在用户持有真实许可证的机器上，`publicDecrypt` 返回真实 JSON 时行为不变（原样放行）。
+- [x] **（ADR-014）解密成功但明文非 JSON 时原样返回**，不替换成伪造载荷
+      —— `test/patch.test.ts` 与 `test/regression-selfcheck.test.ts` 以旧/新判据 A/B 钉死。
+- [x] **（ADR-014，真机 · Windows / Typora 1.14.10）`>= 0.8` 自检分支**：沙箱副本 + 强制
+      `Math.random()=0.95`，运行超过自检触发点后 `SLicense` 保留、`hasL` 保持 true、无 `onUnfillLicense`、
+      进程存活。实测自检定时器 `setTimeout delay=530469ms`（≈8m50s，与 Issue 的「8m51s」吻合）；
+      探针记录 `REAL ok out.len=100 firstChar="p" isJSON=false` → `FINAL out.len=100 identicalToReal=true`
+      （100 字节合法明文逐字节透传）。为对称 A/B 另跑一轮把该定时器压到 20s，结论一致。
+- [x] **（ADR-014，真机 · 对照组）修复前的判据在完全相同条件下复现撤销：**
+      `REAL ok out.len=100 isJSON=false` → `FINAL out.len=163 firstChar="{" identicalToReal=false`
+      （探针记 `!!!!! 生产补丁改写了合法解密结果`），Typora 日志 `2nd 0.95` 后 **7ms** 出现
+      `onUnfillLicense`，注册表 `SLicense` 被清空。自然 530s 与压缩 20s 两种时序下均复现，
+      证明差异只来自判据、与定时器压缩无关。
+- [x] **（ADR-014，真机）`< 0.8` 重新校验分支未受修复影响（回归确认）**：在已注入修复版补丁的
+      真实安装上自然触发（实测 `2nd 0.06506679632211776`），日志为
+      `2nd` → 重读 `[WindowsLicenseLocalStore] SLicense` → `renew` → `[L] pass` →
+      `[renewLicense]: license renewed`，无 `onUnfillLicense`。
+      这条分支会重新解密本工具写入的 18 字节标记（必抛错 ⇒ 仍落入伪造分支），
+      结果证明「解密抛错才伪造」的新判据对既有激活路径完全等价。
 
 ## 完成定义
 

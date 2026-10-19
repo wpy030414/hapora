@@ -45,6 +45,12 @@ Linux（Ubuntu 26.04 / Typora 1.14.9，WSL2）均有真机验收，Fedora / Arch
     只允许在其中使用 `__HAPORA_*__` 形式的占位符，且每个占位符全文件只出现一次。
   - 自校验放行必须**同时保留读取层（fs）与哈希层（crypto.createHash）**：
     两层各自都足以单独通过校验，互为兜底。
+  - `publicDecrypt` 接管（Windows/Linux）**只能在解密抛错时返回伪造载荷，解密成功一律原样透传**，
+    绝不按明文形状（是否 JSON / 是否以 `{` 开头）去猜。因为 Typora 启动约 9 分钟后有一道周期性 RSA
+    自检（`Math.random() >= 0.8` 触发，日志 `2nd <随机数>`，定时器实测 `530469ms`）：用固定密文解密、
+    期望得到一段固定的 **100 字节非 JSON** 明文再做 `Buffer.equals`。按形状猜会把这段合法明文也换成
+    许可证 JSON ⇒ 自检失败 ⇒ 撤销激活并清空 `SLicense`，现象是「激活后能用几分钟到几小时才掉」，
+    **启动验收（只等 6s）在原理上测不到**——只能靠「接管对所有合法输入透明」保证。详见 ADR-014。
   - 伪造载荷里的 `fingerprint`（Windows/Linux）**必须逐字符等于客户端自己算的那一份**，即
     `Base64(SHA256(machineId + "typora"))[0..10].replace(/[/=+-]/g, "a")`——Windows 的 `machineId`
     是 `MachineGuid`，Linux 是 `/etc/machine-id`（回退 `/var/lib/dbus/machine-id`）；
@@ -92,6 +98,9 @@ Linux（Ubuntu 26.04 / Typora 1.14.9，WSL2）均有真机验收，Fedora / Arch
     （日志路径：Windows `%APPDATA%\Typora\typora.log`，Linux `~/.config/Typora/typora.log`）；
     macOS 的判据是验收探针报「许可证记录保持有效……Typora 存活」（记录被 unfill 清除即失败），
     且 `lastTry` 金丝雀在续期窗口之外——窗口外记录存活本身就是 renew 已被短路的自证。
+    **但启动验收只覆盖约 6s 窗口**，测不到延迟 + 概率触发的运行期检查（如上面 `publicDecrypt` 那条
+    的 9 分钟自检）；这类路径由 `pnpm test`（vm 沙箱执行真实渲染产物 + 旧/新判据 A/B 对照）兜住。
+    改动 `patch.js` 的接管语义后，两者都要跑。
   - 文档更新遵循 `scaffold-docs`：README / AGENTS 不写实现细节，实现细节进 `docs/`。
   - **仓库内不得携带任何截图或二进制图片**（`*.png` / `*.jpg` / `*.gif` / `*.webp` / `*.bmp` 等）。
     需要留证的场景一律写成可复现的文字判据（日志关键字、命令、期望输出），由验收过程现场产生。
@@ -110,6 +119,9 @@ Linux（Ubuntu 26.04 / Typora 1.14.9，WSL2）均有真机验收，Fedora / Arch
 - `src/config.ts` — 邮箱 / 序列号的可自定义项，来源优先级与默认值。
 - `src/asar.ts` — `app.asar` 解包 / 打包 / 读单文件 / 读 `main`（仅 asar 路线）。
 - `src/registry.ts` — `HKCU\SOFTWARE\Typora` 读写 + 通用只读查询（仅 Windows 实现使用）。
+- `test/` — 补丁的单元/回归测试（`pnpm test`）：`patch.test.ts` 在 vm 沙箱里执行真实渲染产物、
+  用 crypto/fs/electron 桩复现三类 `publicDecrypt` 调用；`regression-selfcheck.test.ts` 以旧/新判据
+  A/B 对照钉死 ADR-014。覆盖启动验收测不到的延迟+概率路径（如 9 分钟 RSA 自检）。
 - `.env.example` — 可自定义项的模板（`.env` 本身不入库）。
 - `docs/researches/activation-win.md` — Windows（Electron）机制研究报告。
 - `docs/researches/activation-mac.md` — macOS（原生）机制研究报告。
