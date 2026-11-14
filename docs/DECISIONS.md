@@ -503,3 +503,55 @@
   两条分支因此都有实证覆盖。判据详见 `docs/specs/module-license-patch.md` 验收标准末三项与研究报告 §6.1。
 - 何时重新审视：上游把自检改成「解密成功后还要校验输出的某个结构」（此时透明放行不足够），
   或改成用非法输入探测解密函数（此时需重新界定「非法」）。
+
+## ADR-015：显式平台选择，并在 WSL 宿主上桥接 Windows 实现
+
+- 日期：2026-11-14
+- 状态：已采纳
+- 背景（遇到了什么问题）：
+  在 WSL 里运行本工具时，`process.platform` 是 `linux`，平台分派必然选中 Linux 实现；但被改对象
+  可能是 Windows 侧安装的 Typora。只加一个 `--platform windows` 开关还不够：Windows 实现原本假设
+  自己运行在 Windows 上——注册表 / `where.exe` 返回 `C:\...`，在 Linux 里 `existsSync` 恒假；
+  `reg` / `tasklist` 这类裸命令在 WSL 中不存在（不会补 `.exe`）；`%APPDATA%` / `%TEMP%` 未导出；
+  提权用的 `.cmd` 与暂存文件放在 Linux `tmpdir()` 里，Windows 进程根本读不到。
+- 考虑过的方案：
+  1. 在 `hack.ts` 里按 `process.platform` 到处分支，或要求用户在 Windows 侧另跑一份；
+  2. 只加 `--platform` 标志，Windows 实现保持原样（定位、注册表、验收仍不可用）；
+  3. `--platform` + 在 Windows 实现内部做 WSL 桥接（采纳）。
+- 决策：采用方案 3。选择顺序固定为 `--platform` > `HAPORA_PLATFORM` > `process.platform`；
+  未指定时保持自动检测（普通机器零参数不变）。桥接全部收敛在 `src/platform/windows.ts`：
+  - Windows 路径经 `wslpath -u` 映射为 `/mnt/<盘符>/...`（失败时手工回退），`--dir` 两种写法都接受；
+  - Windows 命令一律显式 `.exe`（`reg.exe` / `tasklist.exe` / `taskkill.exe` / `net.exe` /
+    `where.exe` / `powershell.exe` / `cmd.exe`），在真实 Windows 上同样有效；
+  - `%APPDATA%` / `%TEMP%` / `%ProgramFiles%` 经 `cmd.exe /c echo %NAME%` 解析后再转宿主路径；
+  - 盘符浅扫描在 WSL 中改为 `/mnt/*`；
+  - 提权脚本、状态文件与 WSL 侧暂存文件放进 Windows 可见的 `%TEMP%`，脚本内路径经 `wslpath -w`
+    转回 Windows 形式。
+- 为什么选这个：
+  - 「显式意图优先」与 ADR-009 的 `--dir` 一致：用户指定了平台就必须按它执行，不静默回退；
+  - 补丁本身无需特化：它运行在 Windows 的 Typora 进程内，指纹由 Typora 自己读 Windows
+    `MachineGuid` 计算；工具侧只负责把 `SLicense` / `IDate` 写进 Windows 的 `HKCU\SOFTWARE\Typora`。
+    许可证格式、解密接管、验收判据与原生 Windows 完全相同；
+  - 桥接是 Windows 实现内部细节，`hack.ts` 仍只按能力位分支，符合 ADR-010 的分层约束。
+- 为什么不选其他：
+  - 方案 1 让平台判断散落编排层，且用户还得切换环境重跑，违背「一条命令」；
+  - 方案 2 只能定位成功，写注册表、读日志、提权都会失败，是半成品。
+- 后果：
+  - CLI 新增 `--platform` 与 `HAPORA_PLATFORM`；文档同步；
+  - `src/platform/index.ts` 是唯一分派点；`src/registry.ts` 改用 `reg.exe`；
+  - WSL 互操作不可用时（无 `reg.exe` / `wslpath` 等）显式失败，不猜测、不降级；
+  - 未改动 `src/inject/patch.js`、许可证格式与验收判据。
+- 真机验收（2026-11-14 · WSL2 Arch · Windows 侧 Typora）：
+  - `pnpm hack --status --platform win32` 自动定位到
+    `/mnt/c/Users/lyxin/AppData/Local/Programs/Typora`（来源：Windows `HKCU` App Paths），
+    读到入口 `launch.dist.js`、备份状态与注册表 `SLicense` / `IDate`；
+  - `HAPORA_PLATFORM=windows` 等价生效；`--platform freebsd` 以非零码退出并列出可选值；
+  - `pnpm hack --platform windows --yes` 全程 exit 0：从 Windows 侧的原始备份重新注入
+    （入口 1383B → 13136B）、写入 `HKCU\SOFTWARE\Typora`、启动 Windows Typora；
+    本轮日志满足 `[L] pass`、`[watch L] hasL: true`、`[renewLicense]: license renewed`，
+    且无 `Integrity check failed`、无 `unfill due to renew fail`，Typora 进程存活；
+    注册表中 `SLicense = QEBIQVBPUkFfTElDRU5TRUBA#0#11/14/2026`、`IDate = 11/14/2026`。
+  - 本次安装目录在 WSL 中可写，走的是普通复制路径；WSL 提权桥接（`%TEMP%` 暂存 + UAC）
+    已实现但本机未触发。
+- 何时重新审视：WSL 互操作默认关闭成为常态，或 Typora 的 Windows 安装需要无法由 `wslpath`
+  表达的路径（例如非盘符挂载）时。

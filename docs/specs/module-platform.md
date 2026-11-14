@@ -30,6 +30,24 @@ Mach-O 的解析 / 补丁 / 重签 / 备份事务只属于 darwin（`darwin-mach
 
 macOS 没有可用的验收日志：既不存在 `typora.log`，unified log 在启动路径也没有输出（已实测）。
 
+### WSL 宿主上的 Windows 实现（ADR-015）
+
+在 WSL 里显式选择 Windows 平台（`--platform windows` / `HAPORA_PLATFORM=windows`）时，
+宿主是 Linux、被改对象在 Windows 侧。以下桥接只存在于 `src/platform/windows.ts`：
+
+| 事项 | Windows 原生 | WSL 宿主 |
+|------|--------------|----------|
+| 路径视图 | `C:\...` | 注册表 / `where.exe` 的输出经 `wslpath -u` 映射为 `/mnt/<盘符>/...`（失败时手工映射回退） |
+| `--dir` / `HAPORA_TYPORA_DIR` | Windows 路径 | `C:\...` 与 `/mnt/...` 均可，统一转成宿主路径 |
+| 外部命令 | `reg` / `tasklist` / ... | 显式 `reg.exe` / `tasklist.exe` / `taskkill.exe` / `net.exe` / `where.exe` / `powershell.exe` / `cmd.exe` |
+| 用户目录 | `process.env.APPDATA` 等 | 经 `cmd.exe /c echo %NAME%` 解析后再映射为宿主路径 |
+| 盘符浅扫描 | `C:\` … `Z:\` | `/mnt/c` … `/mnt/z` |
+| 提权脚本 / 状态文件 | Linux `tmpdir()`（Windows 原生下自洽） | Windows 可见的 `%TEMP%`；脚本内路径经 `wslpath -w` 转回 Windows 形式 |
+| 提权时的源文件 | 直接引用 | 不在 `/mnt/*` 下的（如 `/tmp` 里暂存的 asar）先复制进 `%TEMP%` 再交给 .cmd |
+
+补丁本身无需特化：它运行在 Windows 的 Typora 进程内，指纹由 Typora 自己读取 Windows
+`MachineGuid` 计算；本工具只负责把 `SLicense` / `IDate` 写进 Windows 的 `HKCU\SOFTWARE\Typora`。
+
 ## 行为
 
 - `locate(overrideDir?)`：显式指定优先，无效即报错不回退；其余来源惰性求值、命中即止，
@@ -63,6 +81,7 @@ macOS 没有可用的验收日志：既不存在 `typora.log`，unified log 在�
 - 浅扫描必须同时设「深度上限」与「目录数上限」，并跳过系统/噪声目录。
 - 平台差异（含能力位与探针）只允许出现在本层；`hack.ts` 按能力位分支，不出现平台名。
 - 新增平台 = 加一个 `src/platform/<id>.ts` 与 `index.ts` 里的一行分支，不改 `hack.ts` 的编排结构。
+- 平台选择只做 id 规范化与分派；WSL 桥接是 Windows 实现内部细节，不得泄漏到编排层。
 
 ## 验收标准
 
@@ -91,3 +110,11 @@ macOS 没有可用的验收日志：既不存在 `typora.log`，unified log 在�
       公式同 Windows），文件内容是整段 JSON 的 **hex 编码**、仅 `SLicense` 键；`patch.js` 增加
       `/etc/machine-id` 回退。详见 `docs/researches/activation-linux.md`。
 - [ ] **（待真机）** Fedora 44（rpm）与 Flatpak 形态的 Linux 验收（机制同构，预期一致）。
+- [x] **（2026-11-14 · WSL2 Arch / Windows Typora）** `pnpm hack --status --platform win32` 在 WSL 中
+      自动定位到 `/mnt/c/Users/lyxin/AppData/Local/Programs/Typora`（源：Windows `HKCU` App Paths），
+      读到入口名 `launch.dist.js`、备份状态、注册表 `SLicense` / `IDate`；`HAPORA_PLATFORM=windows`
+      等价生效；非法平台值以非零码退出。
+- [x] **（2026-11-14 · WSL2 Arch / Windows Typora）** `pnpm hack --platform windows --yes` 全程 exit 0：
+      从原始备份重新注入并写入 Windows 安装目录与 `HKCU\SOFTWARE\Typora`，启动 Windows Typora 后
+      日志满足 `[L] pass`、`[watch L] hasL: true`、`[renewLicense]: license renewed`，无
+      `Integrity check failed` / `unfill due to renew fail`，进程存活（详见 ADR-015）。

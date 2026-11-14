@@ -8,7 +8,7 @@
  */
 
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, join, win32 } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync, spawn } from "node:child_process";
 
@@ -23,7 +23,52 @@ import { scanRootsForInstall, type ScanSpec } from "./scan.js";
 const ASAR_REL = "resources/app.asar";
 const EXE_REL = "Typora.exe";
 
+/**
+ * Running the Windows implementation from a WSL host: Windows paths must be mapped to the
+ * /mnt/<drive> view for Node's fs, and Windows executables must be invoked with an explicit
+ * .exe suffix. Actual Windows hosts keep the native behaviour (every helper is identity).
+ */
+const IS_WSL =
+  process.platform === "linux" &&
+  !!(process.env["WSL_DISTRO_NAME"] || process.env["WSL_INTEROP"]);
+
 let _locateErr = "";
+
+/** A path as the host filesystem sees it (WSL: /mnt/c/...; Windows: unchanged). */
+function toHostPath(raw: string): string {
+  if (!IS_WSL || !raw || raw.startsWith("/")) return raw;
+  const converted = tryExec("wslpath", ["-u", raw])?.trim();
+  if (converted) return converted;
+  const drive = /^([A-Za-z]):[\\/](.*)$/.exec(raw);
+  if (drive) return `/mnt/${drive[1]!.toLowerCase()}/${drive[2]!.replace(/\\/g, "/")}`;
+  return raw.replace(/\\/g, "/");
+}
+
+/** A host path as Windows tools see it (WSL: C:\...; Windows: unchanged). */
+function toWindowsPath(raw: string): string {
+  if (!IS_WSL) return raw;
+  if (/^[A-Za-z]:[\\/]/.test(raw) || raw.startsWith("\\\\")) return raw;
+  const converted = tryExec("wslpath", ["-w", raw])?.trim();
+  if (converted) return converted;
+  const mount = /^\/mnt\/([A-Za-z])(?:\/(.*))?$/.exec(raw);
+  if (mount) return `${mount[1]!.toUpperCase()}:\\${(mount[2] ?? "").replace(/\//g, "\\")}`;
+  return raw;
+}
+
+/** True when a host path lives on a Windows-visible drive. */
+function isWindowsVisible(p: string): boolean {
+  return !IS_WSL || /^\/mnt\/[a-z](?:\/|$)/i.test(p);
+}
+
+/** Windows environment variable; under WSL it is resolved through cmd.exe. */
+function winEnv(name: string): string | undefined {
+  const own = process.env[name];
+  if (own) return own;
+  if (!IS_WSL) return undefined;
+  const out = tryExec("cmd.exe", ["/c", "echo", `%${name}%`])?.trim();
+  if (!out || out === `%${name}%`) return undefined;
+  return out;
+}
 
 /** 从「exe 路径」或「命令行」里解出安装目录。 */
 function dirFromExe(raw: string | null): string | null {
@@ -37,7 +82,7 @@ function dirFromExe(raw: string | null): string | null {
     if (end < 0) return null;
     p = p.slice(0, end + 4);
   }
-  return p.toLowerCase().endsWith(".exe") ? dirname(p) : null;
+  return p.toLowerCase().endsWith(".exe") ? win32.dirname(p) : null;
 }
 
 const CUV = "Microsoft\\Windows\\CurrentVersion";
@@ -106,20 +151,24 @@ function uninstallCandidates(): string[] {
 
 /** PATH 上的 Typora.exe。 */
 function pathCandidates(): string[] {
-  const out = tryExec("where", ["Typora.exe"]);
+  const out = tryExec("where.exe", ["Typora.exe"]);
   if (!out) return [];
-  return out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).map((p) => dirname(p));
+  return out
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !/^INFO:/i.test(l))
+    .map((p) => win32.dirname(p));
 }
 
 /** 三个默认安装位置。 */
 function defaultCandidates(): string[] {
   const dirs: string[] = [];
-  const pf = process.env["ProgramFiles"];
-  if (pf) dirs.push(join(pf, "Typora"));
-  const pf86 = process.env["ProgramFiles(x86)"];
-  if (pf86) dirs.push(join(pf86, "Typora"));
-  const local = process.env.LOCALAPPDATA;
-  if (local) dirs.push(join(local, "Programs", "Typora"));
+  const pf = winEnv("ProgramFiles");
+  if (pf) dirs.push(win32.join(pf, "Typora"));
+  const pf86 = winEnv("ProgramFiles(x86)");
+  if (pf86) dirs.push(win32.join(pf86, "Typora"));
+  const local = winEnv("LOCALAPPDATA");
+  if (local) dirs.push(win32.join(local, "Programs", "Typora"));
   return dirs;
 }
 
@@ -152,6 +201,13 @@ const SCAN_SPEC: ScanSpec = {
 
 function driveRoots(): string[] {
   const roots: string[] = [];
+  if (IS_WSL) {
+    for (let c = "c".charCodeAt(0); c <= "z".charCodeAt(0); c++) {
+      const root = `/mnt/${String.fromCharCode(c)}`;
+      if (existsSync(root)) roots.push(root);
+    }
+    return roots;
+  }
   for (let c = "C".charCodeAt(0); c <= "Z".charCodeAt(0); c++) {
     const root = `${String.fromCharCode(c)}:\\`;
     if (existsSync(root)) roots.push(root);
@@ -176,6 +232,11 @@ const ELEVATED_OK = "HAPORA-OK";
  * 成败不看 PowerShell 的退出码（-Verb RunAs 下不可靠），只看 .cmd 留下的标记文件。
  */
 function elevatedCopy(jobs: CopyJob[]): void {
+  if (IS_WSL) {
+    elevatedCopyWsl(jobs);
+    return;
+  }
+
   const dir = mkdtempSync(join(tmpdir(), "hapora-elev-"));
   const helper = join(dir, "elevated-copy.cmd");
   const status = join(dir, "status.txt");
@@ -188,26 +249,65 @@ function elevatedCopy(jobs: CopyJob[]): void {
     lines.push(`echo ${ELEVATED_OK}> "${status}"`, "exit /b 0");
     writeFileSync(helper, lines.join("\r\n") + "\r\n", "utf-8");
 
-    const script =
-      `$p = Start-Process -FilePath $env:ComSpec -ArgumentList '/c', '"${helper}"' ` +
-      `-Verb RunAs -Wait -PassThru; exit $p.ExitCode`;
-    try {
-      execFileSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], {
-        stdio: ["ignore", "pipe", "pipe"],
-        windowsHide: true,
-      });
-    } catch (err) {
-      const stderr = String((err as { stderr?: Buffer }).stderr ?? "").trim();
-      throw new Error(
-        `提权失败（可能是在 UAC 弹窗里点了「否」）。${stderr ? `powershell: ${stderr}` : ""}`.trim(),
-      );
-    }
-
-    if (!existsSync(status) || readFileSync(status, "utf-8").trim() !== ELEVATED_OK) {
-      throw new Error("提权后的复制没有完成（目标文件可能被占用或磁盘只读）");
-    }
+    runElevatedHelper(helper, status);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * WSL variant: the elevated .cmd must itself live on a Windows-visible drive, and every
+ * path inside it must be a Windows path. WSL-only sources (e.g. the staged asar in /tmp)
+ * are copied into %TEMP% first.
+ */
+function elevatedCopyWsl(jobs: CopyJob[]): void {
+  const winTemp = winEnv("TEMP") ?? winEnv("TMP");
+  if (!winTemp) throw new Error("读不到 Windows 的 TEMP 目录，无法准备提权脚本。");
+  const dir = mkdtempSync(join(toHostPath(winTemp), "hapora-elev-"));
+  const helper = join(dir, "elevated-copy.cmd");
+  const status = join(dir, "status.txt");
+  try {
+    const lines = ["@echo off"];
+    jobs.forEach((job, i) => {
+      if (!isWindowsVisible(job.to)) {
+        throw new Error(`提权写入目标不在 Windows 可访问的路径下：${job.to}`);
+      }
+      let from = job.from;
+      if (!isWindowsVisible(from)) {
+        const staged = join(dir, `${i}-${basename(from)}`);
+        copyFileSync(from, staged);
+        from = staged;
+      }
+      lines.push(`copy /y "${toWindowsPath(from)}" "${toWindowsPath(job.to)}" >nul 2>&1`);
+      lines.push("if errorlevel 1 exit /b 1");
+    });
+    lines.push(`echo ${ELEVATED_OK}> "${toWindowsPath(status)}"`, "exit /b 0");
+    writeFileSync(helper, lines.join("\r\n") + "\r\n", "utf-8");
+
+    runElevatedHelper(toWindowsPath(helper), status);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function runElevatedHelper(helper: string, status: string): void {
+  const script =
+    `$p = Start-Process -FilePath $env:ComSpec -ArgumentList '/c', '"${helper}"' ` +
+    `-Verb RunAs -Wait -PassThru; exit $p.ExitCode`;
+  try {
+    execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+  } catch (err) {
+    const stderr = String((err as { stderr?: Buffer }).stderr ?? "").trim();
+    throw new Error(
+      `提权失败（可能是在 UAC 弹窗里点了「否」）。${stderr ? `powershell: ${stderr}` : ""}`.trim(),
+    );
+  }
+
+  if (!existsSync(status) || readFileSync(status, "utf-8").trim() !== ELEVATED_OK) {
+    throw new Error("提权后的复制没有完成（目标文件可能被占用或磁盘只读）");
   }
 }
 
@@ -221,11 +321,12 @@ export const windowsPlatform: Platform = {
     // 显式指定：给了就必须有效，无效就报错——宁可让用户改路径，也不要静默猜到别处去
     const override = (overrideDir ?? process.env["HAPORA_TYPORA_DIR"] ?? "").trim();
     if (override) {
-      const inst = makeInstall(override, ASAR_REL, EXE_REL);
+      const inst = makeInstall(toHostPath(override), ASAR_REL, EXE_REL);
       if (inst) return inst;
       _locateErr =
         `指定的安装目录无效：${override}\n` +
-        `  该目录下没有 resources\\app.asar（请确认指向 Typora 安装根目录，而非 resources 或 exe 本身）。`;
+        `  该目录下没有 resources\\app.asar（请确认指向 Typora 安装根目录，而非 resources 或 exe 本身）。` +
+        (IS_WSL ? "\n  WSL 里可写 Windows 路径 C:\\... 或挂载路径 /mnt/c/...。" : "");
       return null;
     }
 
@@ -242,7 +343,7 @@ export const windowsPlatform: Platform = {
     for (const [label, gather] of sources) {
       tried.push(label);
       for (const dir of gather()) {
-        const inst = makeInstall(dir, ASAR_REL, EXE_REL);
+        const inst = makeInstall(toHostPath(dir), ASAR_REL, EXE_REL);
         if (inst) return inst;
       }
     }
@@ -258,25 +359,27 @@ export const windowsPlatform: Platform = {
   locateError: () => _locateErr,
 
   isRunning(): boolean {
-    const out = tryExec("tasklist", ["/FI", "IMAGENAME eq Typora.exe", "/NH"]);
+    const out = tryExec("tasklist.exe", ["/FI", "IMAGENAME eq Typora.exe", "/NH"]);
     return !!out && /Typora\.exe/i.test(out);
   },
 
   kill(): void {
     try {
-      execFileSync("taskkill", ["/IM", "Typora.exe", "/F"], { windowsHide: true, stdio: "ignore" });
+      execFileSync("taskkill.exe", ["/IM", "Typora.exe", "/F"], { windowsHide: true, stdio: "ignore" });
     } catch {
       /* 没有在运行 */
     }
   },
 
   launch(install: TyporaInstall): void {
-    spawn(install.exe, [], { detached: true, stdio: "ignore" }).unref();
+    // A detached spawn failure is an async 'error' event; swallow it so verification can
+    // report 'gone' and roll back instead of crashing the CLI (same as the Unix path).
+    spawn(install.exe, [], { detached: true, stdio: "ignore" }).on("error", () => {}).unref();
   },
 
   isAdmin(): boolean {
     try {
-      execFileSync("net", ["session"], { windowsHide: true, stdio: "ignore" });
+      execFileSync("net.exe", ["session"], { windowsHide: true, stdio: "ignore" });
       return true;
     } catch {
       return false;
@@ -331,7 +434,8 @@ export const windowsPlatform: Platform = {
   probeActivation(_install: TyporaInstall, launchedAtMs: number): { state: ProbeState; detail: string } {
     const START_MARKER = "------------------start------------------";
     const SETTLE_MS = 6000; // 自校验在启动约 1s 后触发，hasL 必须活过这个窗口才算数
-    const logPath = join(process.env.APPDATA ?? "", "Typora", "typora.log");
+    const appData = winEnv("APPDATA");
+    const logPath = join(appData ? toHostPath(appData) : "", "Typora", "typora.log");
     const text = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
     const i = text.lastIndexOf(START_MARKER);
     const seg = i >= 0 ? text.slice(i) : "";

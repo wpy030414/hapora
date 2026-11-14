@@ -17,6 +17,8 @@
  * 平台差异全部收敛在 src/platform/，本文件只做编排（按能力位分支，不按平台名）。
  *
  * 参数：
+ *   --platform <windows|macos|linux> 显式指定平台实现（默认按 process.platform 自动检测；
+ *                在 WSL 里用 --platform windows 操作 Windows 侧安装的 Typora）
  *   --dir <路径> 显式指定 Typora 安装根目录（装在非常规位置时用）
  *   --no-verify  做完后不启动验收（默认会验收）
  *   --restore    从备份回滚
@@ -51,7 +53,7 @@ const ok = (msg: string) => console.log(`  ✓ ${msg}`);
 const bad = (msg: string) => console.log(`  ✗ ${msg}`);
 
 /** 改写对象的措辞：asar 路线是 app.asar，Mach-O 路线是 Typora 二进制 */
-const TARGET_LABEL = tp.asarPatchSupported() ? "app.asar" : "Typora 二进制";
+const targetLabel = (): string => (tp.asarPatchSupported() ? "app.asar" : "Typora 二进制");
 
 /**
  * [asar 路线] 判断备份该怎么处理（只看状态，不落盘——真正的写入统一在 installFiles 里做）：
@@ -159,7 +161,7 @@ async function doRestore(install: tp.TyporaInstall, elevate: boolean): Promise<v
     const sig = tp.machoInspect(install).signature;
     ok(`已还原二进制与签名：${sig === "developer-id" ? "Developer ID（原始）" : sig}；许可证记录已还原`);
   } else {
-    ok(`已从备份恢复${TARGET_LABEL}，并清空许可证记录`);
+    ok(`已从备份恢复${targetLabel()}，并清空许可证记录`);
   }
   say("  重新打开 Typora 即回到未激活状态。");
 }
@@ -339,10 +341,29 @@ async function doHack(
 
 async function main(): Promise<void> {
   if (has("--help", "-h")) {
-    say("用法：pnpm hack [--dir <Typora安装目录>] [--no-verify] [--restore] [--status] [--yes]");
+    say("用法：pnpm hack [--platform <windows|macos|linux>] [--dir <Typora安装目录>] [--no-verify] [--restore] [--status] [--yes]");
+    say("  --platform <平台>  显式指定平台实现（默认按宿主机自动检测；也可用环境变量 HAPORA_PLATFORM）");
+    say("                     WSL 里操作 Windows 侧安装的 Typora：--platform windows");
     say("  --dir <路径>  显式指定 Typora 安装根目录（装在非常规位置时使用；也可用环境变量 HAPORA_TYPORA_DIR）");
+    say("                 WSL 里可写 C:\\... 或 /mnt/c/... 两种形式");
     say("可自定义：仓库根目录 .env 里的 EMAIL / CODE（也可用环境变量覆盖）");
     return;
+  }
+
+  const requestedPlatform = flagValue("--platform");
+  if (argv.some((a) => a === "--platform" || a.startsWith("--platform=")) && !requestedPlatform) {
+    say("--platform 需要一个值：windows / macos / linux");
+    process.exitCode = 1;
+    return;
+  }
+  if (requestedPlatform) {
+    try {
+      tp.selectPlatform(requestedPlatform);
+    } catch (err) {
+      say((err as Error).message);
+      process.exitCode = 1;
+      return;
+    }
   }
 
   let label: string;
@@ -377,7 +398,7 @@ async function main(): Promise<void> {
       process.exitCode = 1;
       return;
     }
-    say(`${label}：Typora 位于需要管理员权限的目录（${install.dir}），改写${TARGET_LABEL}需要提权。`);
+    say(`${label}：Typora 位于需要管理员权限的目录（${install.dir}），改写${targetLabel()}需要提权。`);
     if (tp.machoPatchSupported()) {
       say("  补丁与 entitlements 在临时目录里准备，提权一次性用于备份 + 写入 + 重签。");
     } else {

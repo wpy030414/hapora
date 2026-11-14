@@ -70,10 +70,10 @@ Typora 原生进程（补丁后）
 |------|------|
 | `src/hack.ts` | CLI 入口。参数解析、步骤编排、启动验收、失败回滚、输出报告。只调用平台无关的门面，不出现平台分支。 |
 | `src/typora.ts` | 平台无关门面：把「定位 / 进程 / 启动 / 能力位 / 写入 / 许可证 / 验收探针」这些语义动作转给当前平台实现。 |
-| `src/platform/index.ts` | 按 `process.platform` 选平台实现；不支持的平台直接抛错。 |
+| `src/platform/index.ts` | 按 `--platform` / `HAPORA_PLATFORM` / `process.platform`（优先级从高到低）选平台实现；不支持的平台直接抛错。 |
 | `src/platform/types.ts` | 平台契约（`Platform` 接口）、安装信息的构造与校验、写入权限探测、外部命令封装。 |
 | `src/platform/scan.ts` | 平台无关的「浅扫描」兜底：在给定根目录下找安装目录，带深度与目录数上限。 |
-| `src/platform/windows.ts` | Windows 实现：注册表 App Paths/文件关联/卸载表 + PATH + 默认目录 + 盘符浅扫描；`tasklist`/`taskkill`；UAC 提权；许可证写注册表。 |
+| `src/platform/windows.ts` | Windows 实现：注册表 App Paths/文件关联/卸载表 + PATH + 默认目录 + 盘符浅扫描；`tasklist`/`taskkill`；UAC 提权；许可证写注册表。在 WSL 里被显式选中时（ADR-015）：Windows 路径经 `wslpath` 映射为 `/mnt/*`、命令显式带 `.exe`、`%APPDATA%`/`%TEMP%` 经 `cmd.exe` 解析、提权脚本放 Windows 可见的 `%TEMP%`。 |
 | `src/platform/darwin.ts` | macOS 实现：Spotlight(`mdfind`) + `/Applications`、`~/Applications`；`.app` 包解析（bundle id 与可执行名读自 Info.plist）；`pgrep`/`pkill`；**走 Mach-O 路线**：二进制补丁 + 记录伪造，验收走记录轮询。 |
 | `src/platform/darwin-license.ts` | macOS 许可证记录文件的编解码与伪造：binary plist 最小编解码器、keyed archive 组装、AES 加解密、指纹/密钥派生、伪造配方（lastTry 金丝雀）。 |
 | `src/platform/darwin-macho.ts` | macOS Mach-O 补丁：fat/符号表解析与补丁点定位（零硬编码偏移）、ret 补丁生成、entitlements 导出注入、codesign 重签封装、包外备份与事务化落地（状态机 + 失败紧急还原）。 |

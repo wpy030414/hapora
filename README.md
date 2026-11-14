@@ -34,6 +34,7 @@ pnpm hack               # 激活（默认会自动验收，失败则回滚）
 pnpm hack --no-verify   # 只打补丁，不启动验收
 pnpm hack --restore     # 回滚到原始状态
 pnpm hack --status      # 只看状态，不改动
+pnpm hack --platform windows   # 显式指定平台（默认按宿主机自动检测）
 pnpm hack --dir "D:\Software\Typora"   # 装在非常规位置时显式指定安装目录
 pnpm test               # 补丁的单元/回归测试（vm 沙箱，约 0.2s，无需安装 Typora）
 ```
@@ -41,6 +42,20 @@ pnpm test               # 补丁的单元/回归测试（vm 沙箱，约 0.2s，
 安装目录的探测顺序：`--dir` / `HAPORA_TYPORA_DIR` → 注册表（Windows）/ Spotlight（macOS）/ `which`（Linux）
 → PATH → 常见默认目录 → 卸载记录 → 各盘浅扫描。命中即止，因此装在 D 盘或绿色目录通常也能自动找到；
 实在找不到时用 `--dir` 指定，或设置环境变量 `HAPORA_TYPORA_DIR`。
+
+平台选择优先级：`--platform` > `HAPORA_PLATFORM` > 宿主机自动检测；可选值 `windows` / `macos` / `linux`。
+
+在 WSL 里操作 Windows 侧安装的 Typora：
+
+```bash
+pnpm hack --platform windows            # 自动定位 Windows 侧安装
+pnpm hack --platform windows --dir 'C:\Users\<你>\AppData\Local\Programs\Typora'
+pnpm hack --platform windows --dir /mnt/c/Users/<你>/AppData/Local/Programs/Typora
+```
+
+需要 WSL 互操作可用（`reg.exe`、`tasklist.exe`、`powershell.exe`、`wslpath`）。路径会在
+`C:\...` 与 `/mnt/<盘符>/...` 之间自动转换；改写、写注册表、启动与读日志都作用于 Windows 侧。
+WSL 里直接写 Windows 目录通常无需提权；确实需要提权时会弹一次 UAC。
 
 执行 `pnpm hack` 时若 Typora 正在运行，需要先关闭它，或加 `--yes` 让脚本自行结束进程。
 

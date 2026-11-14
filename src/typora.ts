@@ -6,12 +6,15 @@
  *   2. 每个动作在调用时才解析当前平台，便于测试与未来替换实现。
  */
 
-import { platform } from "./platform/index.js";
+import { platform, selectPlatform as selectPlatformImpl } from "./platform/index.js";
 import type {
   TyporaInstall, CopyJob, LicenseInput, LicenseView, ProbeState, MachoInspection, MachoApplyResult,
 } from "./platform/types.js";
 
 export type { TyporaInstall, CopyJob, LicenseInput, LicenseView, ProbeState, MachoInspection, MachoApplyResult };
+
+/** 显式选择平台实现（`--platform`）；无效值抛错。 */
+export const selectPlatform = (raw: string): void => selectPlatformImpl(raw);
 
 /** 当前平台的展示名（用于输出）。 */
 export const platformLabel = (): string => platform().label;

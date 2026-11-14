@@ -3,6 +3,8 @@
 本仓库是对 Typora 激活机制的逆向研究与激活工具，入口只有一个：`pnpm hack`。
 支持 Windows / macOS（arm64）/ 桌面 Linux；三个平台均已完整实现——Windows、macOS（arm64）、
 Linux（Ubuntu 26.04 / Typora 1.14.9，WSL2）均有真机验收，Fedora / Arch 与 Flatpak 形态机制同构、待真机验收。
+另支持在 WSL 宿主上显式选择 Windows 实现（`--platform windows` / `HAPORA_PLATFORM=windows`），
+直接操作 Windows 侧安装的 Typora（ADR-015）。
 
 ## 概述
 
@@ -88,6 +90,9 @@ Linux（Ubuntu 26.04 / Typora 1.14.9，WSL2）均有真机验收，Fedora / Arch
   - **平台差异只允许出现在 `src/platform/`**：定位 / 进程 / 启动 / 验收探针 / 提权 / 许可证存储
     这几件事，其余逻辑必须平台无关；`src/hack.ts` 里按**能力位**（`asarPatchSupported` /
     `machoPatchSupported`）分支，不得出现平台名判断。`src/registry.ts` 只许 Windows 实现使用。
+  - 平台选择顺序固定为 `--platform` > `HAPORA_PLATFORM` > `process.platform`，分派只在
+    `src/platform/index.ts`；WSL 宿主上的路径 / `.exe` 命令 / `%APPDATA%`/`%TEMP%` / 提权暂存的桥接
+    只允许写在 `src/platform/windows.ts` 内（ADR-015）。
   - **未实现的平台能力必须显式失败**：不得「猜一个位置写进去」——尤其许可证存储，
     猜错会产出「改了却没激活」且无任何报错的状态。宁可在改动文件之前退出。
   - `sudo` 只允许用 `-n`（非交互），绝不能出现会等待输入密码的形式（会挂住 CLI）。

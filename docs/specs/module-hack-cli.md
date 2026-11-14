@@ -16,8 +16,12 @@
   解包 / 注入 / 打包 / 补丁生成 / entitlements 准备全部在用户临时目录里完成，最后用**一次**平台提权把
   「备份 + 成品（+ Mach-O 路线的重签）」落盘，其余步骤（写许可证、启动 Typora、读验收信号）仍以
   普通用户身份进行。目录可写时不提权。
+- `--platform <windows|macos|linux>`：显式指定平台实现，优先级高于环境变量 `HAPORA_PLATFORM`
+  与宿主机自动检测。用于 WSL：`process.platform` 是 `linux`，但被改对象是 Windows 侧安装的 Typora。
+  无效值以非零码退出并列出可选值；未指定时保持 `process.platform` 自动检测。
 - `--dir <路径>`：显式指定 Typora 安装根目录。指向的路径不符合平台结构（没有 `resources\app.asar` /
   不是 `.app` 包）时**直接报错退出**，不回退到自动探测（显式指定必须被尊重，静默猜别处比报错更糟）。
+  在 WSL 里选择 Windows 平台时，`C:\...` 与 `/mnt/<盘符>/...` 两种写法都接受。
 - `--no-verify`：跳过启动验收（仍然改写），并在输出中提示跳过的风险。
 - `--restore`：把被改对象从备份拷回（asar / Mach-O 二进制 + CodeResources 字节等价拷回 ⇒
   Developer ID 签名自愈 / 许可证记录），并清空许可证记录。二进制还原与记录还原分开走
@@ -64,8 +68,12 @@
 
 - 任何写操作之前必须先有可用的备份。
 - 支持的平台：Windows / macOS / 桌面 Linux。不支持的平台以非零码退出，不做降级。
+- 平台选择优先级：`--platform` > `HAPORA_PLATFORM` > `process.platform`。选择动作只做 id 规范化
+  与分派，不改变能力位分支结构。
 - 平台差异（定位 / 进程 / 启动 / 验收探针 / 提权 / 许可证存储）全部由 `src/platform/` 提供，
   本入口只按**能力位**（`asarPatchSupported` / `machoPatchSupported`）分支，不得出现平台名判断。
+- WSL 宿主上选择 Windows 平台时，Windows 侧路径/命令的桥接（`wslpath`、`.exe` 后缀、
+  `%APPDATA%`/`%TEMP%` 解析、提权暂存）全部属于 `src/platform/windows.ts`，本入口不感知。
 - 许可证存储未实现的平台（当前是 Linux）：**在改动任何文件之前**以非零码退出并说明原因，
   不得产出「改了却没激活」的半成品。`--status` 与 `--restore` 不受此限。
 - **只有「往安装目录写文件」这一步可能需要管理员（asar 与 Mach-O 路线）**：不得因为要提权就把
@@ -92,6 +100,11 @@
 - 备份记录的是另一个入口名（换过版本）：刷新备份。
 - 显式指定的目录里没有 `resources\app.asar`：非零码退出并说明原因，**不**回退到自动探测。
 - 定位是惰性的：某个来源命中后，其后的来源（尤其是全盘扫描）不得被执行。
+- **[WSL → Windows]** 显式选择 `windows` 平台时，注册表 / `where.exe` 返回的 `C:\...` 必须映射为
+  `/mnt/<盘符>/...` 再做 `existsSync`；`--dir` 的两种路径写法都要接受。
+- **[WSL → Windows]** Windows 命令必须显式带 `.exe` 后缀（WSL 的裸命令查找不会补 PATHEXT）。
+- **[WSL → Windows]** 提权脚本、状态文件与 WSL 侧暂存文件必须落在 Windows 可见的 `%TEMP%` 下，
+  且脚本内部路径必须转成 Windows 形式；否则 UAC 提权进程读不到文件。
 - 查询不存在的注册表键是常态，`reg.exe` 的报错不得泄漏到用户终端（`stdio.stderr` 需静默）。
 - 中文 Windows 上 `reg query /ve` 的默认值标签是 `(默认)` 而非 `(Default)`：解析默认值不得依赖标签文案。
 - 注入后的长度回填导致字节数变化：报错，不打包。

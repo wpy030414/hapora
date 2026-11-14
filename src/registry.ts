@@ -14,7 +14,9 @@ import { execFileSync } from "node:child_process";
 export const REG_PATH = "HKCU\\SOFTWARE\\Typora";
 
 function reg(args: string[], quiet = false): string {
-  return execFileSync("reg", args, {
+  // Explicit .exe suffix keeps the same code working when the Windows platform is selected
+  // from a WSL host (where bare command lookup does not append PATHEXT).
+  return execFileSync("reg.exe", args, {
     encoding: "utf-8",
     windowsHide: true,
     // quiet：查询不存在的键是常态，不能让 reg.exe 的报错漏到用户终端上
