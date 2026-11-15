@@ -7,9 +7,11 @@
  * 许可证存储仍是 ~/Library 下的记录文件，由补丁保证它永不过期）。
  */
 
-import { existsSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
+
+import { rmFile } from "../fsx.js";
 
 export const BACKUP_SUFFIX = ".hapora-orig.bak";
 
@@ -160,7 +162,9 @@ export function probeWriteAccess(path: string): boolean {
   const probe = path + ".hapora-write-test";
   try {
     writeFileSync(probe, "");
-    unlinkSync(probe);
+    // 探针删除要带退避：Windows 上刚写完的文件可能还被扫描进程握着，
+    // 一次删不掉就误判成「目录不可写」，会把本可直写的安装目录推进提权分支。
+    rmFile(probe);
     return true;
   } catch {
     return false;

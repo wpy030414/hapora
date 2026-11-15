@@ -24,7 +24,7 @@
  *   --yes, -y    跳过确认（Typora 正在运行时）
  */
 
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -32,6 +32,7 @@ import { pack, readEntry, readMain, unpack } from "./asar.js";
 import * as tp from "./typora.js";
 import { loadConfig, LICENSE_SHAPE, repoRoot, type Config } from "./config.js";
 import { inject, isPatched, stripPatch, loadTemplate } from "./patch.js";
+import { rmTreeBestEffort } from "./fsx.js";
 
 const argv = process.argv.slice(2);
 const has = (...names: string[]) => names.some((n) => argv.includes(n));
@@ -238,7 +239,8 @@ async function doHack(
       jobs.push({ from: staged, to: install.target });
       tp.installFiles(jobs, { elevate: opts.elevate });
     } finally {
-      rmSync(work, { recursive: true, force: true });
+      // 收尾不能顶替 try 里的真实错误，也不能把已完成的运行变成失败：删不掉就留着。
+      rmTreeBestEffort(work);
     }
     if (backupState === "created") ok(`已备份原始 app.asar → ${install.backup}`);
     else if (backupState === "refreshed") ok("检测到 Typora 被重装/升级，已刷新原始备份");
