@@ -5,18 +5,20 @@
  */
 
 import { extractAll, createPackage, extractFile } from "@electron/asar";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync } from "node:fs";
+
+import { rmFile, rmTree } from "./fsx.js";
 
 export const PACKAGE_JSON = "package.json";
 
 export async function unpack(asarPath: string, destDir: string): Promise<void> {
-  rmSync(destDir, { recursive: true, force: true });
+  rmTree(destDir);
   mkdirSync(destDir, { recursive: true });
   await extractAll(asarPath, destDir);
 }
 
 export async function pack(srcDir: string, asarPath: string): Promise<void> {
-  rmSync(asarPath, { force: true });
+  rmFile(asarPath);
   await createPackage(srcDir, asarPath);
 }
 

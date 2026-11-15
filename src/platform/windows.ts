@@ -7,12 +7,13 @@
  * 验收：读 %APPDATA%\Typora\typora.log 的关键字（hasL / Integrity check failed / unfill）。
  */
 
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync, spawn } from "node:child_process";
 
 import * as reg from "../registry.js";
+import { rmTreeBestEffort } from "../fsx.js";
 import { formatDate, licenseValue } from "../patch.js";
 import {
   isPermissionError, makeInstall, probeWriteAccess, tryExec,
@@ -207,7 +208,8 @@ function elevatedCopy(jobs: CopyJob[]): void {
       throw new Error("提权后的复制没有完成（目标文件可能被占用或磁盘只读）");
     }
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    // 提权批次的临时目录只是脚手架，删不掉（多半是 cmd/杀软还在读它）不该判失败。
+    rmTreeBestEffort(dir);
   }
 }
 

@@ -7,10 +7,12 @@
  * 猜错了会产出「打了补丁但没激活」的半成品，比直接失败更难排查）。
  */
 
-import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
+
+import { rmTreeBestEffort } from "../fsx.js";
 
 import {
   isPermissionError, probeWriteAccess, tryExec,
@@ -64,7 +66,7 @@ export function elevatedRun(lines: string[], desc: string): void {
       );
     }
   } finally {
-    rmSync(work, { recursive: true, force: true });
+    rmTreeBestEffort(work);
   }
 }
 

@@ -15,11 +15,12 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
 import { BACKUP_SUFFIX, tryExec, type CopyJob, type MachoApplyResult, type MachoInspection, type TyporaInstall } from "./types.js";
+import { rmTreeBestEffort } from "../fsx.js";
 import { elevatedRun, shellQuote } from "./unix.js";
 
 /* ---------------- Mach-O 解析（纯函数） ---------------- */
@@ -606,6 +607,7 @@ export function applyMachOPatch(install: TyporaInstall, opts: { elevate: boolean
     emergencyRestore();
     throw new Error(`Mach-O 补丁落地失败（已尝试从备份还原）：${(err as Error).message}`);
   } finally {
-    rmSync(work, { recursive: true, force: true });
+    // stage 目录是脚手架：不许顶替 catch 里那条「已还原」的真实错误。
+    rmTreeBestEffort(work);
   }
 }
